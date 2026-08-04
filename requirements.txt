@@ -1,8 +1,12 @@
-# Core dependencies for the HandGestureNet multi-task model
-# (train.py / evaluate.py / visualize.py)
+# --- Core (training / evaluation, src/) ---
 torch
 numpy
 opencv-python
 pillow
 matplotlib
- 
+
+# --- Web demo (frontend/) ---
+fastapi
+uvicorn[standard]
+python-multipart
+transformers
