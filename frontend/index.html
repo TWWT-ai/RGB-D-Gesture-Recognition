@@ -222,7 +222,7 @@ function App() {
   return (
     <div className="wrap">
       <h1>✋ Hand Gesture Recognition</h1>
-      <p className="sub">检测框 + 手部分割 + 手势分类（当前 depth 用 0 填充，精度低于训练环境）</p>
+      <p className="sub">检测框 + 手部分割 + 手势分类</p>
       <div className="tabs">
         <div className={"tab " + (mode==="upload" ? "active" : "")} onClick={() => setMode("upload")}>🖼 上传图片</div>
         <div className={"tab " + (mode==="camera" ? "active" : "")} onClick={() => setMode("camera")}>📷 实时摄像头</div>
