@@ -240,8 +240,33 @@ def main():
     parser.add_argument("--best-tol", type=float, default=0.15)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
+    # >>> [YOLOv2-NEW] anchors from a file beat anchors hand-pasted into utils.py:
+    # on Kaggle/Colab the repo is cloned fresh every run, so editing utils.py by
+    # hand is both awkward and easy to get silently out of date.
+    parser.add_argument("--anchors", type=str, default="",
+                        help="JSON produced by kmeans_anchors.py --out-json; "
+                             "empty means use the ANCHORS list in utils.py")
     # Pack all the top argument into one
     args = parser.parse_args()
+
+    # >>> [YOLOv2-NEW] resolve the anchors BEFORE anything expensive, so a
+    # mismatched split aborts in a second rather than after scanning the dataset.
+    anchors = ANCHORS
+    if args.anchors:
+        with open(args.anchors, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        anchors = [tuple(a) for a in meta["anchors"]]
+        # The split the anchors were fitted on MUST match the split we are about
+        # to train on, otherwise the priors have seen people this run holds out.
+        fitted = meta.get("split", {})
+        here = {"seed": args.seed, "val_frac": args.val_frac, "test_frac": args.test_frac}
+        if fitted and fitted != here:
+            raise SystemExit(
+                f"\nAnchors in {args.anchors} were fitted with split {fitted},\n"
+                f"but you are training with {here}.\n"
+                f"Re-run kmeans_anchors.py with the same --seed/--val-frac/--test-frac.")
+        print(f"Anchors loaded from {args.anchors} "
+              f"(out-of-bag mean best-IoU {meta.get('mean_best_iou_oob', '?')})")
 
     # Keeping the training sample set the same every training at the start
     th.manual_seed(args.seed)
@@ -262,11 +287,9 @@ def main():
     )
     
     #Creating model, optimizer, loss
-    # >>> [YOLOv2-CHANGED] B=2 free boxes -> len(ANCHORS) anchor-based boxes.
-    # Run kmeans_anchors.py first and paste its output into utils.ANCHORS.
-    model = HandGestureNet(in_channels=4, n_classes=10, anchors=ANCHORS).to(device)
-    print(f"Detection head: {len(ANCHORS)} anchors (w, h, normalised) = "
-          f"{[(round(a, 3), round(b, 3)) for a, b in ANCHORS]}")
+    model = HandGestureNet(in_channels=4, n_classes=10, anchors=anchors).to(device)
+    print(f"Detection head: {len(anchors)} anchors (w, h, normalised) = "
+          f"{[(round(a, 3), round(b, 3)) for a, b in anchors]}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss()
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

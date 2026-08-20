@@ -31,6 +31,7 @@ RUN IT (CPU only, no GPU needed, writes nothing except the figure):
 """
 
 import argparse
+import json
 import pathlib
 
 import numpy as np
@@ -391,6 +392,11 @@ def main():
     # Relative to the folder you RUN from. Default assumes the project root,
     # which is where you have actually been running it from.
     parser.add_argument("--fig-out", type=str, default="figures/anchor_kmeans.png")
+    # >>> [YOLOv2-NEW] writing the anchors to a file means train.py can read them
+    # directly. On Kaggle/Colab you cannot conveniently hand-edit utils.py inside
+    # a freshly cloned repo, and a stale hand-pasted list is a silent bug.
+    parser.add_argument("--out-json", type=str, default="",
+                        help="also write the anchors (plus provenance) to this JSON")
     args = parser.parse_args()
 
     train_ids, _, _ = split_persons(args.data_root, args.seed,
@@ -466,6 +472,27 @@ def main():
     for cw, ch in clusters:
         print(f"    ({cw:.4f}, {ch:.4f}),")
     print("]")
+
+    # >>> [YOLOv2-NEW] machine-readable copy, so train.py --anchors can consume
+    # it and nobody has to retype five pairs of numbers correctly.
+    if args.out_json:
+        out = pathlib.Path(args.out_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "anchors": [[round(float(cw), 4), round(float(ch), 4)] for cw, ch in clusters],
+            "k": k,
+            "n_boxes": int(len(boxes)),
+            "mean_best_iou_in_sample": round(float(kmean), 4),
+            "mean_best_iou_oob": round(float(om), 4),
+            "mean_best_iou_oob_sd": round(float(osd), 4),
+            "aspect_aware_baseline": round(float(aspect), 4),
+            "gain_over_aspect_aware": round(float(kmean - aspect), 4),
+            "split": {"seed": args.seed, "val_frac": args.val_frac,
+                      "test_frac": args.test_frac},
+            "train_persons": sorted(train_ids),
+        }
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"\nAnchors + provenance written to {out}")
 
     # --- the figure --------------------------------------------------------
     try:

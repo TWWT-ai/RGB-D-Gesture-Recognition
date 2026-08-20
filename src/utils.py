@@ -14,6 +14,14 @@ S = 7
 # on the 7 TRAIN persons only (699 annotated boxes). val/test persons were
 # excluded, otherwise the priors would be fitted on the people we test on.
 #
+# !! These were fitted with the DEFAULT --test-frac 0.1, which holds out 2 people
+# !! and trains on 7. The Kaggle training command uses --test-frac 0, which holds
+# !! out 1 and trains on 8 -- a different split, so this list does NOT match it.
+# !! For that run, pass train.py --anchors <json from kmeans_anchors --out-json>;
+# !! the JSON records the split it was fitted with and train.py refuses to run if
+# !! it disagrees with the split you are training on. This list is only the
+# !! fallback for a --test-frac 0.1 run.
+#
 #   mean best-IoU, in-sample                 0.8049
 #   mean best-IoU, out-of-bag                0.7973 +/- 0.0043   <- honest number
 #   aspect-aware hand-picked baseline (k=5)  0.7761
