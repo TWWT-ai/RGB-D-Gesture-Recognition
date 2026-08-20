@@ -10,24 +10,43 @@ from dataloader import get_dataLoaders
 from dataloader import HandGestureDataset
 from model import HandGestureNet
 from utils import compute_intersection_over_union
+from utils import shape_iou, anchor_tensor, ANCHORS     # >>> [YOLOv2-NEW]
 # Grid size
-S = 7 
+S = 7
 
 #---------------------------------------------------
 # Loss Function
 #---------------------------------------------------
 
-def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=0.5):
+def yolo_detection_loss(prediction, target, B=None, lambda_coord=5.0, lambda_noobj=0.5,
+                        anchors=None):
     """
         Steps:
-        1. Split cells into two groups -> 
+        1. Split cells into two groups ->
         2. Push confidence toward zero for no-object cells ->
         3. Responsible-box selection ->
         4. Computing the three loss term: xy, wh, conf ->
         5. Weighted sum
+
+    >>> [YOLOv2-CHANGED] Step 3 is the part that changed.
+    YOLOv1 picked the responsible box by asking which of the B PREDICTIONS
+    currently overlaps the ground truth best. That is circular: at epoch 1 the
+    predictions are noise, so the choice is noise, and two boxes can keep
+    swapping roles for many epochs.
+    YOLOv2 picks it by asking which ANCHOR has the closest SHAPE to the
+    ground-truth box. The anchors never change during training, so a
+    tall-thin hand is always handled by the tall-thin anchor. Each anchor
+    gets to specialise instead of all of them chasing the average box.
     """
 
     N = prediction.size(0)
+    # >>> [YOLOv2-CHANGED] B is the anchor count now; read it off the tensor
+    # so it can never disagree with the head.
+    if B is None:
+        B = prediction.shape[-1] // 5
+    if anchors is None:
+        anchors = anchor_tensor(ANCHORS, device=prediction.device, dtype=prediction.dtype)
+    anchors = anchors.to(device=prediction.device, dtype=prediction.dtype)
     # Unzip the combined last index back to Box (B) and (x, y, w, h, confidence)
     prediction = prediction.view(N, S, S, B, 5)
 
@@ -49,11 +68,17 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
     prediction_object = prediction[object_mask]
     target_object = target[object_mask]
 
-    inter_over_unions = compute_intersection_over_union(prediction_object[..., :4], target_object[:, None, : 4])
-    best_iou, best_idx = inter_over_unions.max(dim=1)
+    # >>> [YOLOv2-CHANGED] responsible box = best SHAPE match to an anchor.
+    # Was: argmax over IoU of the current predictions (see docstring).
+    best_idx = shape_iou(target_object[:, 2:4], anchors).argmax(dim=1)
 
-    # Fancy indexing: using the selected best 
+    # Fancy indexing: using the selected best
     response = prediction_object[th.arange(prediction_object.size(0)), best_idx]
+
+    # >>> [YOLOv2-NEW] the confidence target is still "how well does the box
+    # you actually predicted overlap the truth", so we still need that IoU --
+    # we just no longer use it to CHOOSE the box.
+    best_iou = compute_intersection_over_union(response[:, :4], target_object[:, :4])
 
     # Calculating loss 
     loss_xy = F.mse_loss(response[:, 0:2], target_object[:, 0:2], reduction="sum")
@@ -69,7 +94,8 @@ def yolo_detection_loss(prediction, target, B=2, lambda_coord=5.0, lambda_noobj=
     return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
 
 
-def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0):
+def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0,
+                 anchors=None):     # >>> [YOLOv2-NEW]
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
 
@@ -80,7 +106,8 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
     # has_mask is a per-sample flag (1.0 = annotated, 0.0 = classification-only).
     has_mask = targets["has_mask"].bool()
     if has_mask.any():
-        loss_detection = yolo_detection_loss(detection_pred[has_mask], targets["det"][has_mask])
+        loss_detection = yolo_detection_loss(detection_pred[has_mask], targets["det"][has_mask],
+                                             anchors=anchors)     # >>> [YOLOv2-NEW]
         loss_segmentation = segmentation_criterion(segmentation_pred[has_mask],
                                                    targets["Mask"][has_mask].float())
     else:
@@ -106,6 +133,9 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
                     classification_criterion, device, lambda_segmentation,
                     lambda_classification, lambda_detection=1.0):
     model.train()
+    # >>> [YOLOv2-NEW] read the anchors off the model, so the loss can never
+    # be matched against a different anchor set from the one the head decoded with
+    anchors = model.detecting_head.anchors
     running = {"det": 0.0,
               "seg": 0.0,
               "cls": 0.0,
@@ -122,7 +152,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         outputs = model(images)
         loss, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
-                                   lambda_classification, lambda_detection)
+                                   lambda_classification, lambda_detection,
+                                   anchors=anchors)     # >>> [YOLOv2-NEW]
 
         # Cleaning the previously loaded data first
         optimizer.zero_grad()
@@ -151,7 +182,8 @@ def validate(model, loader, segmentation_criterion,
             classification_criterion, device, lambda_segmentation,
             lambda_classification, lambda_detection=1.0):
     model.eval()
-    running = {"det": 0.0, 
+    anchors = model.detecting_head.anchors     # >>> [YOLOv2-NEW]
+    running = {"det": 0.0,
               "seg": 0.0,
               "cls": 0.0, 
               "total": 0.0
@@ -166,8 +198,9 @@ def validate(model, loader, segmentation_criterion,
         outputs = model(images)
         _, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
-                                   lambda_classification, lambda_detection)
-        
+                                   lambda_classification, lambda_detection,
+                                   anchors=anchors)     # >>> [YOLOv2-NEW]
+
         # Adding the loss to the training model
         for k in running:
             running[k] += parts[k]
@@ -229,7 +262,11 @@ def main():
     )
     
     #Creating model, optimizer, loss
-    model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
+    # >>> [YOLOv2-CHANGED] B=2 free boxes -> len(ANCHORS) anchor-based boxes.
+    # Run kmeans_anchors.py first and paste its output into utils.ANCHORS.
+    model = HandGestureNet(in_channels=4, n_classes=10, anchors=ANCHORS).to(device)
+    print(f"Detection head: {len(ANCHORS)} anchors (w, h, normalised) = "
+          f"{[(round(a, 3), round(b, 3)) for a, b in ANCHORS]}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss()
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -285,6 +322,9 @@ def main():
                 "val_seg_loss": val_m["seg"],
                 "val_det_loss": val_m["det"],
                 "args": vars(args),
+                "anchors": model.anchors_list,     # >>> [YOLOv2-NEW] weights are
+                # meaningless without the anchors they were decoded against, so
+                # they travel together in the same file
             }, output_directory / "best.pth")
             print(f"  ↳ new best (cls_acc {best_val_acc:.3f}, "
                   f"seg {val_m['seg']:.3f}, det {val_m['det']:.3f}), checkpoint saved")
@@ -294,7 +334,8 @@ def main():
                   f"{'seg' if not seg_ok else 'det'} regressed beyond tolerance, NOT saved")
 
     # Save the best model/value overall
-    th.save({"epoch": args.epochs, "model_state": model.state_dict()},
+    th.save({"epoch": args.epochs, "model_state": model.state_dict(),
+             "anchors": model.anchors_list},     # >>> [YOLOv2-NEW]
                output_directory / "last.pth")
     print("Training finished.")
 

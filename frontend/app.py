@@ -38,7 +38,7 @@ sys.path.insert(0, SRC_DIR)
 assert os.path.exists(os.path.join(SRC_DIR, "model.py")), f"model.py not found in: {SRC_DIR}"
 assert os.path.exists(WEIGHTS), f"weights file not found: {WEIGHTS}"
 
-from model import HandGestureNet          # noqa: E402
+from model import HandGestureNet, load_handgesture_net   # noqa: E402  # >>> [YOLOv2-CHANGED]
 from utils import extract_best_pred_box   # noqa: E402
 
 # Gesture names in label order (G01..G10)
@@ -57,11 +57,14 @@ depth_pipe = pipeline(task="depth-estimation",
 print("[demo] Depth-Anything-V2-Small (HF) loaded")
 
 # Main model
-model_main = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
+# >>> [YOLOv2-CHANGED] the demo must use the anchors the checkpoint was trained
+# with. Point WEIGHTS at a checkpoint produced on THIS branch -- a checkpoint
+# from `main` has no anchors and will be rejected with a clear message.
 checkpoint = th.load(WEIGHTS, map_location=device)
-model_main.load_state_dict(checkpoint.get("model_state", checkpoint) if isinstance(checkpoint, dict) else checkpoint)
+model_main = load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=device)
 model_main.eval()
 print(f"[demo] model loaded from {WEIGHTS} on {device}")
+print(f"[demo] anchors: {[(round(a, 3), round(b, 3)) for a, b in model_main.anchors_list]}")
 
 
 def preprocess(rgb_np):

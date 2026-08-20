@@ -2,6 +2,62 @@ import torch as th
 
 S = 7
 
+# >>> [YOLOv2-NEW] Anchor priors: (width, height) normalised to the image, so
+# they live in exactly the same [0, 1] space as encode_yolo_target's w, h.
+# YOLOv1 had no anchors at all: each cell regressed B boxes from scratch.
+# YOLOv2's "dimension clusters" replace that guesswork with shapes measured
+# from the data, so the network only has to predict a small correction.
+#
+# Produced by:
+#   python src/kmeans_anchors.py \
+#       --data-root ../data/datasets/dataset_merged_all --seed 42 --k 5
+# on the 7 TRAIN persons only (699 annotated boxes). val/test persons were
+# excluded, otherwise the priors would be fitted on the people we test on.
+#
+#   mean best-IoU, in-sample                 0.8049
+#   mean best-IoU, out-of-bag                0.7973 +/- 0.0043   <- honest number
+#   aspect-aware hand-picked baseline (k=5)  0.7761
+#   -> k-means is worth +0.0288 over a baseline that already knows hands are
+#      taller than they are wide. (The +0.16 over SQUARE anchors is a straw man.)
+#
+# If you change --k or the split, RE-RUN the script and repaste. The numbers
+# above are the claim; do not let them drift from the list below.
+ANCHORS = [
+    (0.0826, 0.1763),
+    (0.1429, 0.2388),
+    (0.1585, 0.3237),
+    (0.2143, 0.2656),
+    (0.2210, 0.3929),
+]
+
+
+# >>> [YOLOv2-NEW]
+def anchor_tensor(anchors=None, device=None, dtype=th.float32):
+    """(A, 2) tensor of anchor (w, h). One place, so nothing drifts."""
+    if anchors is None:
+        anchors = ANCHORS
+    return th.tensor([tuple(a) for a in anchors], dtype=dtype, device=device)
+
+
+# >>> [YOLOv2-NEW]
+def shape_iou(boxes_wh, anchors_wh):
+    """
+    IoU between (M,2) ground-truth (w,h) and (A,2) anchor (w,h), pretending
+    both are centred on the same point.
+
+    This is SHAPE-only IoU, used to decide which anchor is "responsible" for a
+    ground-truth box. YOLOv1 decided that by asking which of its B predictions
+    happened to overlap best, which is circular: at the start of training the
+    predictions are random, so the assignment is random too. Matching on shape
+    is stable from epoch 1.
+    """
+    inter = (th.minimum(boxes_wh[:, None, 0], anchors_wh[None, :, 0]) *
+             th.minimum(boxes_wh[:, None, 1], anchors_wh[None, :, 1]))
+    area_b = (boxes_wh[:, 0] * boxes_wh[:, 1])[:, None]
+    area_a = (anchors_wh[:, 0] * anchors_wh[:, 1])[None, :]
+    return inter / (area_b + area_a - inter + 1e-9)
+
+
 def compute_intersection_over_union(box1, box2):
     # Computing left and right boundary for both boxes (cx, cy, w, h)
     b1_x1, b1_y1 = box1[..., 0] - box1[..., 2] / 2, box1[..., 1] - box1[..., 3] / 2         # left bound
@@ -37,12 +93,17 @@ def encode_yolo_target(boundary_box, s=S):
     return target
 
 
-def decode_predictions(prediction, B=2, conf_thresh=0.25, s=S):
+def decode_predictions(prediction, B=None, conf_thresh=0.25, s=S):
     """
     Inverse of the model output: [S, S, B*5] (one image, after permute)
     -> list of (x_min, y_min, x_max, y_max, conf), all in [0, 1].
     Used by visualize.py / evaluation, NOT by training.
     """
+    # >>> [YOLOv2-CHANGED] B is now the number of ANCHORS, which changed from 2
+    # to len(ANCHORS). Infer it from the tensor instead of hard-coding it, so
+    # changing the anchor list can never silently mis-reshape the output.
+    if B is None:
+        B = prediction.shape[-1] // 5
     prediction = prediction.view(s, s, B, 5)
     boxes = []
     for row in range(s):
@@ -65,13 +126,17 @@ def extract_gt_box(det_target):
     return det_target[object_mask][0, :4]
 
 
-def extract_best_pred_box(det_pred, B=2):
+def extract_best_pred_box(det_pred, B=None):
     """
     From the raw head output of ONE image [S, S, B*5],
     return the (cx, cy, w, h) of the box with the highest confidence.
     Center format on purpose, so compute_intersection_over_union can
     compare it with the ground truth directly.
     """
+    # >>> [YOLOv2-CHANGED] same reason as decode_predictions: infer the number
+    # of anchors from the tensor rather than assuming 2.
+    if B is None:
+        B = det_pred.shape[-1] // 5
     det_pred = det_pred.view(S, S, B, 5)
     conf = det_pred[..., 4]
     # argmax over the flattened S*S*B boxes, then unravel back to 3 indices

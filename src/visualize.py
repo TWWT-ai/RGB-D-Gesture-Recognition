@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader
 from dataloader import get_dataLoaders, HandGestureDataset
-from model import HandGestureNet
+from model import HandGestureNet, load_handgesture_net     # >>> [YOLOv2-CHANGED]
 from utils import extract_gt_box, extract_best_pred_box
 from evaluate import evaluate
 
@@ -186,9 +186,9 @@ def main():
             test_frac=args.test_frac,
         )
 
-    model = HandGestureNet(in_channels=4, n_classes=10, B=2).to(device)
+    # >>> [YOLOv2-CHANGED] rebuild with the checkpoint's own anchors
     checkpoint = th.load(args.weights, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
+    model = load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=device)
     print(f"Loaded {args.weights}")
 
     # 1. Per-image predictions: boxes + masks + labels
