@@ -1,6 +1,7 @@
 dataset/
 test.py
 data/
+.cache/
 weights/
 figures/
 *.pth
@@ -10,3 +11,5 @@ Cheat Sheet.md
 *.pdf
 .vscode
 *.ipynb
+.agents/
+CLAUDE.md

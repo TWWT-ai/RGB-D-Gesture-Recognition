@@ -140,8 +140,14 @@ class SegmentationHead(nn.Module):
         x = self.up2(th.cat([x, f28], dim=1))
         x = F.interpolate(x, scale_factor=2)
         x = self.up3(th.cat([x, f56], dim=1))
-        x = F.interpolate(x, size=(448, 448), mode="bilinear", align_corners=False)
-        return self.out(x)
+        # Collapse 64 channels -> 1 BEFORE the upsample, not after. A 1x1 conv is a
+        # per-pixel linear map and bilinear interpolation is a weighted average whose
+        # weights sum to 1, so the two commute exactly -- same numbers out. Doing it
+        # in this order means we never materialise the [N, 64, 448, 448] tensor
+        # (822 MB at batch 16, plus the same again for its gradient); the upsample
+        # now runs on a single channel instead.
+        x = self.out(x)
+        return F.interpolate(x, size=(448, 448), mode="bilinear", align_corners=False)
     
 
 class HandGestureNet(nn.Module):

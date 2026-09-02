@@ -2,6 +2,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import argparse
+import os
 from torch.utils.data import DataLoader
 from pathlib import Path
 import json
@@ -80,8 +81,13 @@ def yolo_detection_loss(prediction, target, B=None, lambda_coord=5.0, lambda_noo
     # we just no longer use it to CHOOSE the box.
     best_iou = compute_intersection_over_union(response[:, :4], target_object[:, :4])
 
-    # Calculating loss 
-    loss_xy = F.mse_loss(response[:, 0:2], target_object[:, 0:2], reduction="sum")
+    # Calculating loss
+    # NOTE the * S. response[:, 0:2] is (sigmoid(t) + cell_index) / S, i.e. a
+    # WHOLE-IMAGE coordinate, but both YOLOv1 and YOLOv2 weigh this term in
+    # CELL-RELATIVE units. Without the rescale the squared error is S^2 = 49x too
+    # small, so lambda_coord=5.0 was really behaving like ~0.1 and the centre
+    # regression was being drowned out by the confidence terms.
+    loss_xy = F.mse_loss(response[:, 0:2] * S, target_object[:, 0:2] * S, reduction="sum")
     # Square root would punish small boundary boxes more 
     loss_wh = F.mse_loss(
         th.sqrt(response[:, 2:4].clamp(min=1e-6)),
@@ -117,10 +123,14 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
         loss_segmentation = zero
 
     total = lambda_det * loss_detection + lambda_seg * loss_segmentation + lambda_cls * loss_classification
-    losses = {"det": float(loss_detection),
-              "seg": float(loss_segmentation),
-              "cls": float(loss_classification),
-              "total": float(total)
+    # DETACHED TENSORS, not floats. float(x) on a CUDA tensor forces a
+    # device->host sync, and this ran four times per batch purely for logging --
+    # which stalls the pipeline so the CPU can never run ahead and queue the next
+    # batch. The callers accumulate these on-device and .item() once per epoch.
+    losses = {"det": loss_detection.detach(),
+              "seg": loss_segmentation.detach(),
+              "cls": loss_classification.detach(),
+              "total": total.detach()
               }
     return total, losses
 
@@ -129,39 +139,67 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
 # Train and validation
 #---------------------------------------------------
 
+def _forward_fp32(model, images, use_amp):
+    """
+    Run the network under autocast, then hand the heads back in fp32.
+
+    The convolutions are the part worth running in half precision; the losses are
+    not. yolo_detection_loss sums squared errors and divides by an IoU, and the
+    detection head's decode goes through exp() -- all of that is happier in fp32,
+    and it is a rounding-error slice of the runtime anyway.
+    """
+    device_type = images.device.type
+    with th.autocast(device_type=device_type, dtype=th.float16, enabled=use_amp):
+        outputs = model(images)
+    return tuple(o.float() for o in outputs)
+
+
 def train_one_epoch(model, loader, optimizer, segmentation_criterion,
                     classification_criterion, device, lambda_segmentation,
-                    lambda_classification, lambda_detection=1.0):
+                    lambda_classification, lambda_detection=1.0,
+                    scaler=None, use_amp=False):
     model.train()
     # >>> [YOLOv2-NEW] read the anchors off the model, so the loss can never
     # be matched against a different anchor set from the one the head decoded with
     anchors = model.detecting_head.anchors
-    running = {"det": 0.0,
-              "seg": 0.0,
-              "cls": 0.0,
-              "total": 0.0
+    # Accumulate ON DEVICE as tensors -- see the note in compute_loss. These are
+    # only pulled back to the host once, after the whole epoch.
+    zero = th.zeros((), device=device)
+    running = {"det": zero.clone(),
+              "seg": zero.clone(),
+              "cls": zero.clone(),
+              "total": zero.clone()
               }
-    correct, total_samples = 0, 0          # track TRAIN classification accuracy
+    correct = zero.clone()                 # track TRAIN classification accuracy
+    total_samples = 0
 
     for images, targets in loader:
-        # Copying what is on CPU onto GPU (RAM to VRAM)
-        images = images.to(device)
-        targets = {k: v.to(device) for k, v in targets.items()}
+        # Copying what is on CPU onto GPU (RAM to VRAM). non_blocking pairs with
+        # the loader's pin_memory=True so the copy overlaps with compute.
+        images = images.to(device, non_blocking=True)
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
         # Computing loss for each image
-        outputs = model(images)
+        outputs = _forward_fp32(model, images, use_amp)
         loss, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
                                    lambda_classification, lambda_detection,
                                    anchors=anchors)     # >>> [YOLOv2-NEW]
 
         # Cleaning the previously loaded data first
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         # The chain rule part, this tells you on which way you should adjust the direction
         # dloss/dw = dloss/dy * dy/dz * dz/dw
-        loss.backward()
-        # Using Adam formula to update the and override the old data
-        optimizer.step()
+        # Under fp16 the gradients are scaled up before backward and unscaled
+        # before the step, so small gradients do not flush to zero.
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            # Using Adam formula to update the and override the old data
+            optimizer.step()
 
         # Adding the loss to the training model
         for k in running:
@@ -169,33 +207,35 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
 
         # Train classification accuracy (compare against val to spot over/underfitting)
         pred_label = outputs[2].argmax(dim=1)
-        correct += (pred_label == targets["Label"]).sum().item()
+        correct += (pred_label == targets["Label"]).sum()
         total_samples += images.size(0)
 
     n = len(loader)
-    metrics = {k: v / n for k, v in running.items()}
-    metrics["cls_acc"] = correct / total_samples
+    metrics = {k: v.item() / n for k, v in running.items()}
+    metrics["cls_acc"] = correct.item() / total_samples
     return metrics
 
 @th.no_grad()
 def validate(model, loader, segmentation_criterion,
             classification_criterion, device, lambda_segmentation,
-            lambda_classification, lambda_detection=1.0):
+            lambda_classification, lambda_detection=1.0, use_amp=False):
     model.eval()
     anchors = model.detecting_head.anchors     # >>> [YOLOv2-NEW]
-    running = {"det": 0.0,
-              "seg": 0.0,
-              "cls": 0.0, 
-              "total": 0.0
+    zero = th.zeros((), device=device)
+    running = {"det": zero.clone(),
+              "seg": zero.clone(),
+              "cls": zero.clone(),
+              "total": zero.clone()
               }
-    correct, total_samples = 0, 0
+    correct = zero.clone()
+    total_samples = 0
 
     for images, targets in loader:
         # Copying what is on CPU onto GPU (RAM to VRAM)
-        images = images.to(device)
-        targets = {k: v.to(device) for k, v in targets.items()}
+        images = images.to(device, non_blocking=True)
+        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
 
-        outputs = model(images)
+        outputs = _forward_fp32(model, images, use_amp)
         _, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
                                    lambda_classification, lambda_detection,
@@ -205,14 +245,14 @@ def validate(model, loader, segmentation_criterion,
         for k in running:
             running[k] += parts[k]
 
-        # Classification accuracy 
+        # Classification accuracy
         pred_label = outputs[2].argmax(dim=1)
-        correct += (pred_label == targets["Label"]).sum().item()
+        correct += (pred_label == targets["Label"]).sum()
         total_samples += images.size(0)
 
     n = len(loader)
-    metrics = {k: v / n for k, v in running.items()}
-    metrics["cls_acc"] = correct / total_samples
+    metrics = {k: v.item() / n for k, v in running.items()}
+    metrics["cls_acc"] = correct.item() / total_samples
     return metrics
 
 
@@ -225,13 +265,25 @@ def main():
     parser = argparse.ArgumentParser(description="Train HandGestureNet (CW1)")
     parser.add_argument("--data-root", type=str, default="data/")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
+    # matches get_dataLoaders' own default; the two used to disagree (8 vs 16)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-cls", type=float, default=1.0)
     parser.add_argument("--lambda-det", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=2)
+    # 2 workers could not keep a GPU fed: __getitem__ is ~28 ms of PNG decoding,
+    # so the loader, not the network, set the epoch time.
+    parser.add_argument("--num-workers", type=int, default=min(8, os.cpu_count() or 2))
+    # Decode+resize each frame ONCE into a memmap instead of every epoch. Point
+    # this at writable scratch (on Kaggle: /kaggle/working/cache, since
+    # /kaggle/input is read-only). Empty = no cache, decode every time.
+    parser.add_argument("--cache-dir", type=str, default="",
+                        help="directory for the decoded-frame cache; "
+                             "empty disables caching")
+    # Mixed precision. On by default for CUDA, ignored on CPU.
+    parser.add_argument("--amp", dest="amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--n-val-persons", type=int, default=5)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
@@ -274,6 +326,15 @@ def main():
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    use_amp = bool(args.amp) and device.type == "cuda"
+    if device.type == "cuda":
+        # The input shape is fixed at 448x448, so let cuDNN benchmark its
+        # algorithms once on the first batch and reuse the winner after that.
+        th.backends.cudnn.benchmark = True
+    scaler = th.amp.GradScaler("cuda") if use_amp else None
+    print(f"Mixed precision: {'on (fp16)' if use_amp else 'off (fp32)'}  |  "
+          f"dataloader workers: {args.num_workers}")
+
     # Splitting data (3-way by person; test_loader is NEVER touched here —
     # it exists so the split is carved out consistently, evaluate.py uses it)
     train_loader, validation_loader, test_loader = get_dataLoaders(
@@ -284,6 +345,7 @@ def main():
         num_workers=args.num_workers,
         val_frac=args.val_frac,
         test_frac=args.test_frac,
+        cache_dir=args.cache_dir or None,
     )
     
     #Creating model, optimizer, loss
@@ -306,9 +368,11 @@ def main():
     # Training loop
     for epoch in range(1, args.epochs + 1):
         train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion,
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det,
+                                  scaler=scaler, use_amp=use_amp)
         val_m = validate(model, validation_loader, segmentation_criterion,
-                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det)
+                                  classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det,
+                                  use_amp=use_amp)
         scheduler.step()
 
         # so the curve survives even if Colab disconnects mid-training

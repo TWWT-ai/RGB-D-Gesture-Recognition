@@ -3,13 +3,24 @@ from torch.utils.data import DataLoader
 import PIL.Image as Image
 import pathlib
 import re
+import hashlib
+import json
 import numpy as np
 import cv2
 from utils import encode_yolo_target
 
 
+def _worker_init(worker_id):
+    """
+    OpenCV starts its own thread pool inside every DataLoader worker. With N
+    workers each spawning N threads on a 2-core Kaggle box the workers spend
+    more time fighting each other than decoding, so pin each one to 1 thread.
+    """
+    cv2.setNumThreads(0)
+
+
 def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
-                    val_frac=0.1, test_frac=0.1):
+                    val_frac=0.1, test_frac=0.1, cache_dir=None):
     root = pathlib.Path(root)
 
     # Persons come from the RGB files now (not annotation), so persons that only
@@ -43,24 +54,38 @@ def get_dataLoaders(root, batch_size=16, n_val_persons=5, seed=0, num_workers=2,
     # TRAIN: use ALL frames (annotated_only=False) -> classification sees every
     # rgb+depth image; detection/segmentation only train on the annotated ones.
     train_ds = HandGestureDataset(root, person_ids=train_ids, augment=True, use_flip=True,
-                                  use_depth=True, annotated_only=False)
+                                  use_depth=True, annotated_only=False, cache_dir=cache_dir)
     # VAL / TEST: annotated_only=True so evaluate.py (which needs boxes + masks)
     # and the seg/det guardrail keep working on real ground truth.
     val_ds = HandGestureDataset(root, person_ids=val_ids, augment=False,
-                                use_depth=True, annotated_only=True)
+                                use_depth=True, annotated_only=True, cache_dir=cache_dir)
     test_ds = HandGestureDataset(root, person_ids=test_ids, augment=False,
-                                 use_depth=True, annotated_only=True) if test_ids else val_ds
+                                 use_depth=True, annotated_only=True,
+                                 cache_dir=cache_dir) if test_ids else val_ds
 
-    train_loader = DataLoader(train_ds, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    # persistent_workers: without it the workers are torn down and respawned for
+    # BOTH loaders on every single epoch. prefetch_factor: keep more batches in
+    # flight so the GPU is never waiting on a PNG decode.
+    loader_kwargs = dict(num_workers=num_workers, pin_memory=True,
+                         worker_init_fn=_worker_init)
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_ds, batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size, shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader, test_loader
 
 
 class HandGestureDataset():
+    # Bump when the cached array layout/dtypes change, so old caches are rebuilt
+    # instead of being read back with the wrong meaning.
+    CACHE_VERSION = 1
+
     def __init__(self, root, person_ids=None, transform=None, augment=False, use_flip=False,
-                 use_depth=False, annotated_only=True):
+                 use_depth=False, annotated_only=True, cache_dir=None):
         self.root = pathlib.Path(root)
         self.transform = transform
         self.augment = augment
@@ -74,6 +99,15 @@ class HandGestureDataset():
         self.n_annotated = 0
         self.n_unannotated = 0
         self.IMAGE_SIZE = 448
+
+        # Cache state. The memmaps themselves are opened LAZILY in __getitem__ so
+        # this object stays picklable (Windows/spawn) and each worker gets its own
+        # file handles (Linux/fork).
+        self.cache_paths = None
+        self._mm = None
+
+        # One directory listing per folder, not one per frame.
+        dir_index = {}
 
         # Enumerate over RGB frames (not annotations) so un-annotated frames are included
         for rgb_path in sorted(self.root.rglob("rgb/*.png")):
@@ -91,13 +125,13 @@ class HandGestureDataset():
             label = int(gesture_directory.name[1:3]) - 1
 
             # Depth is REQUIRED (the model always takes a depth channel)
-            depth_path = self._find_by_stem(clip_directory / "depth", stem)
+            depth_path = self._find_by_stem(clip_directory / "depth", stem, dir_index)
             if depth_path is None:
                 self.skipped += 1
                 continue
 
             # Mask is OPTIONAL now
-            mask_path = self._find_by_stem(clip_directory / "annotation", stem)
+            mask_path = self._find_by_stem(clip_directory / "annotation", stem, dir_index)
 
             # If we only want annotated frames, skip the ones without a mask
             if self.annotated_only and mask_path is None:
@@ -125,20 +159,127 @@ class HandGestureDataset():
         if len(self.samples) == 0:
             raise RuntimeError(f"No File found in this root: {self.root}")
 
+        if cache_dir:
+            self._prepare_cache(cache_dir)
+
     @staticmethod
-    def _find_by_stem(folder, stem):
-        """Return the file in `folder` whose stem matches exactly, else None."""
-        if not folder.is_dir():
-            return None
-        for p in sorted(folder.iterdir()):
-            if p.stem == stem:
-                return p
-        return None
+    def _find_by_stem(folder, stem, dir_index=None):
+        """
+        Return the file in `folder` whose stem matches exactly, else None.
 
-    def __len__(self):
-        return len(self.samples)
+        The folder is listed ONCE and memoised in `dir_index`; the previous
+        version re-listed the directory for every single frame, which made the
+        dataset scan O(frames x files-per-folder).
+        """
+        key = str(folder)
+        if dir_index is None:
+            dir_index = {}
+        if key not in dir_index:
+            if folder.is_dir():
+                dir_index[key] = {p.stem: p for p in sorted(folder.iterdir())}
+            else:
+                dir_index[key] = {}
+        return dir_index[key].get(stem)
 
-    def __getitem__(self, index):
+    # ------------------------------------------------------------------
+    # Decoded-frame cache
+    # ------------------------------------------------------------------
+    # Every epoch this dataset used to re-decode three 640x480 PNGs per sample
+    # and re-run three cv2.resize calls, ~28 ms of pure CPU that produces the
+    # exact same arrays every time. The decode+resize happens BEFORE any
+    # augmentation, so the result is deterministic and safe to cache.
+    #
+    # Arrays are stored as .npy memmaps: the OS page cache keeps the hot parts
+    # in RAM, and a worker read is a memcpy instead of a PNG decode.
+    #
+    # dtypes are chosen so the cache is BIT-EXACT with the uncached path:
+    #   rgb   uint8   -- PIL decode and INTER_LINEAR resize are both uint8
+    #   depth float32 -- resize runs on float32, so fractional values are real
+    #   mask  uint8   -- INTER_NEAREST on a 0/1 array only ever yields 0 or 1
+
+    def _cache_key(self):
+        h = hashlib.sha1()
+        h.update(f"v{self.CACHE_VERSION}|{self.IMAGE_SIZE}|".encode())
+        for s in self.samples:
+            h.update(str(s["RGB"]).encode())
+            h.update(b"|")
+            h.update(str(s["Mask"] or "").encode())
+            h.update(b"\n")
+        return h.hexdigest()[:16]
+
+    def _prepare_cache(self, cache_dir):
+        cache_dir = pathlib.Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = self._cache_key()
+        paths = {
+            "meta": cache_dir / f"{key}.json",
+            "rgb": cache_dir / f"{key}_rgb.npy",
+            "depth": cache_dir / f"{key}_depth.npy",
+            "mask": cache_dir / f"{key}_mask.npy",
+        }
+
+        if all(p.exists() for p in paths.values()):
+            try:
+                meta = json.loads(paths["meta"].read_text())
+            except (OSError, ValueError):
+                meta = {}
+            if meta.get("n") == len(self.samples) and meta.get("complete"):
+                print(f"Frame cache: reusing {key} ({len(self.samples)} samples) in {cache_dir}")
+                self.cache_paths = {k: str(v) for k, v in paths.items() if k != "meta"}
+                return
+            print(f"Frame cache: {key} is stale or incomplete, rebuilding")
+
+        self._build_cache(paths, key)
+        self.cache_paths = {k: str(v) for k, v in paths.items() if k != "meta"}
+
+    def _build_cache(self, paths, key):
+        n, size = len(self.samples), self.IMAGE_SIZE
+        gb = n * (size * size * 3 + size * size * 4 + size * size) / 1e9
+        print(f"Frame cache: building {key} -- {n} samples, ~{gb:.1f} GB, one-off")
+
+        # Write to .tmp first so an interrupted build can never be mistaken for a
+        # finished one.
+        tmp = {k: pathlib.Path(str(v) + ".tmp") for k, v in paths.items() if k != "meta"}
+        rgb_mm = np.lib.format.open_memmap(tmp["rgb"], mode="w+", dtype=np.uint8,
+                                           shape=(n, size, size, 3))
+        depth_mm = np.lib.format.open_memmap(tmp["depth"], mode="w+", dtype=np.float32,
+                                             shape=(n, size, size))
+        mask_mm = np.lib.format.open_memmap(tmp["mask"], mode="w+", dtype=np.uint8,
+                                            shape=(n, size, size))
+        try:
+            for i in range(n):
+                rgb, depth, mask, _ = self._decode(i)
+                rgb_mm[i] = rgb
+                depth_mm[i] = depth
+                mask_mm[i] = mask.astype(np.uint8)
+                if (i + 1) % 500 == 0 or i + 1 == n:
+                    print(f"  cached {i + 1}/{n}", flush=True)
+            rgb_mm.flush(); depth_mm.flush(); mask_mm.flush()
+        finally:
+            del rgb_mm, depth_mm, mask_mm
+
+        for k, t in tmp.items():
+            t.replace(paths[k])
+        paths["meta"].write_text(json.dumps({
+            "n": n, "image_size": size, "version": self.CACHE_VERSION, "complete": True}))
+        print(f"Frame cache: built {key}")
+
+    def _open_cache(self):
+        """Open the memmaps in whichever process is asking (worker or main)."""
+        self._mm = {k: np.load(v, mmap_mode="r") for k, v in self.cache_paths.items()}
+
+    def __getstate__(self):
+        # Workers started with spawn (Windows) pickle the dataset. An open memmap
+        # would pickle as its full contents, so drop the handles and let each
+        # worker reopen them from cache_paths.
+        state = self.__dict__.copy()
+        state["_mm"] = None
+        return state
+
+    # ------------------------------------------------------------------
+
+    def _decode(self, index):
+        """Decode + resize one sample from disk. Returns (rgb, depth, mask, has_mask)."""
         s = self.samples[index]
 
         # 1. RGB into numpy
@@ -165,6 +306,31 @@ class HandGestureDataset():
         rgb = cv2.resize(rgb, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
         depth = cv2.resize(depth, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (self.IMAGE_SIZE, self.IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
+
+        return rgb, depth, mask, has_mask
+
+    def _read(self, index):
+        """Same tuple as _decode, but served from the cache when there is one."""
+        if self.cache_paths is None:
+            return self._decode(index)
+        if self._mm is None:
+            self._open_cache()
+        # np.array(...) rather than a bare slice: the memmap is read-only and the
+        # code below writes into `depth` in place.
+        rgb = np.array(self._mm["rgb"][index])
+        depth = np.array(self._mm["depth"][index])
+        mask = self._mm["mask"][index].astype(np.float32)
+        has_mask = 1.0 if self.samples[index]["Mask"] is not None else 0.0
+        return rgb, depth, mask, has_mask
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        s = self.samples[index]
+
+        # Decode + resize (or read the cached result -- identical either way)
+        rgb, depth, mask, has_mask = self._read(index)
 
         # Augmentation
         if self.augment:
