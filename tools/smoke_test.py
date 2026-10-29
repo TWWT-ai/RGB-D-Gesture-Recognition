@@ -1,4 +1,4 @@
-"""CPU smoke test for the YOLOv3 port. Run from src/: python ../tools/smoke_test.py"""
+"""CPU smoke test for the YOLOv4 port. Run from src/: python ../tools/smoke_test.py"""
 import sys, os, math, tempfile
 _here = os.path.dirname(os.path.abspath(__file__))
 for _cand in (os.path.join(_here, "src"), os.path.join(_here, "..", "src")):
@@ -13,9 +13,10 @@ import numpy as np
 
 from utils import (ANCHORS, GRIDS, anchor_tensor, shape_iou, encode_yolo_target,
                    decode_predictions, extract_best_pred_box, extract_gt_box,
-                   compute_intersection_over_union, split_anchors_by_scale, S)
-from model import HandGestureNet, DetectionHead, load_handgesture_net, ARCH
-from train import yolo_detection_loss, compute_loss, gt_boxes_from_target
+                   compute_intersection_over_union, split_anchors_by_scale, S,
+                   bbox_ciou)
+from model import HandGestureNet, DetectionHead, load_handgesture_net, ARCH, SPP
+from train import yolo_detection_loss, compute_loss, gt_boxes_from_target, assign_targets
 import torch.nn as nn
 
 th.manual_seed(0)
@@ -41,8 +42,10 @@ assert seg.shape == (2, 1, 448, 448), seg.shape
 assert cls.shape == (2, 10), cls.shape
 d = det
 assert th.isfinite(det).all()
-assert (d[..., 0] >= 0).all() and (d[..., 0] <= 1).all(), "cx out of [0,1]"
-assert (d[..., 1] >= 0).all() and (d[..., 1] <= 1).all(), "cy out of [0,1]"
+# YOLOv4 grid-sensitivity decode may overshoot the image by (scale_xy-1)/2 cells
+slack = max((DetectionHead.SCALE_XY[g] - 1) / 2 / g for g in GRIDS) + 1e-6
+assert (d[..., 0] >= -slack).all() and (d[..., 0] <= 1 + slack).all(), "cx out of range"
+assert (d[..., 1] >= -slack).all() and (d[..., 1] <= 1 + slack).all(), "cy out of range"
 assert (d[..., 4] >= 0).all() and (d[..., 4] <= 1).all(), "conf out of [0,1]"
 assert (d[..., 2] > 0).all() and (d[..., 3] > 0).all(), "w/h must be positive"
 # objectness prior: everything starts near p = 0.01, not 0.5
@@ -62,13 +65,16 @@ out = head(feats)
 lay = head.layout()
 for a in range(A):
     Sa = int(lay["grid"][a]); off = int(lay["offset"][a])
+    tol = (DetectionHead.SCALE_XY[Sa] - 1) / 2 / Sa + 1e-4
     cnt = int(lay["count"][a]); loc = int(lay["local"][a])
     for r in range(Sa):
         for c in range(Sa):
             cx, cy = out[0, off + (r * Sa + c) * cnt + loc, :2].tolist()
-            assert c / Sa - 1e-4 <= cx <= (c + 1) / Sa + 1e-4, (a, r, c, cx)
-            assert r / Sa - 1e-4 <= cy <= (r + 1) / Sa + 1e-4, (a, r, c, cy)
-print("2. centre stays inside its own cell  OK (layout indices verified)")
+            assert c / Sa - tol <= cx <= (c + 1) / Sa + tol, (a, r, c, cx)
+            assert r / Sa - tol <= cy <= (r + 1) / Sa + tol, (a, r, c, cy)
+            # and with sigmoid -> 1 the stretched decode DOES pass the border
+            assert cx > (c + 1) / Sa, (a, r, c, cx)
+print("2. centre locked to its cell (+ grid-sensitivity slack)  OK")
 
 # ---- 3. anchor assignment is by shape, and is stable ---------------------
 anchors = anchor_tensor(ANCHORS)
@@ -99,16 +105,32 @@ print(f"4. det loss {loss.item():.4f}, grad norm {gnorm:.1f}   OK")
 lay = model.detecting_head.layout()
 fake = th.zeros(1, M, 5); fake[..., 2:4] = 0.1
 gt = th.tensor([0.43, 0.52, 0.2, 0.3])
-b = shape_iou(gt[None, 2:4], lay["anchors"]).argmax().item()
-Sg = int(lay["grid"][b]); col, row = int(gt[0] * Sg), int(gt[1] * Sg)
-fi = int(lay["offset"][b]) + (row * Sg + col) * int(lay["count"][b]) + int(lay["local"][b])
+box_idx, anc, fi = assign_targets(gt[None], lay)
+assert len(fi) >= 1 and len(set(fi.tolist())) == len(fi)
 fake[0, fi, :4] = gt; fake[0, fi, 4] = 1.0
 tgt = th.zeros(1, S, S, 5); tgt[0, 3, 3] = th.tensor([*gt.tolist(), 1.0])
 l_perfect = yolo_detection_loss(fake, tgt, lay).item()
-fake[0, fi, 0] += 0.02
+fake[0, fi[0], 0] += 0.02
 l_off = yolo_detection_loss(fake, tgt, lay).item()
 assert l_perfect < 1e-3 and l_off > l_perfect, (l_perfect, l_off)
-print(f"4b. perfect box -> loss {l_perfect:.2e}, nudged -> {l_off:.2e}   OK")
+print(f"4b. {len(fi)} positives; perfect -> loss {l_perfect:.2e}, nudged -> {l_off:.2e}   OK")
+
+# ---- 4c. CIoU ------------------------------------------------------------
+b1 = th.tensor([0.5, 0.5, 0.2, 0.3])
+assert abs(bbox_ciou(b1, b1).item() - 1.0) < 1e-5
+far = th.tensor([0.9, 0.9, 0.05, 0.05], requires_grad=True)
+c = bbox_ciou(far, b1)
+assert c.item() < 0 and compute_intersection_over_union(far, b1).item() == 0
+c.backward()
+assert far.grad.abs().sum() > 0, "CIoU must still give a gradient with zero overlap"
+assert abs(bbox_ciou(b1 * 0.5, th.tensor([0.26, 0.25, 0.1, 0.15])).item() -
+           bbox_ciou(b1, th.tensor([0.52, 0.5, 0.2, 0.3])).item()) < 1e-4, "scale-invariant"
+print("4c. CIoU: 1 for identical, <0 and still a gradient when disjoint, scale-invariant  OK")
+
+# ---- 4d. SPP keeps the spatial size and quadruples the channels ----------
+y = SPP()(th.randn(1, 8, 7, 7))
+assert y.shape == (1, 32, 7, 7), y.shape
+print("4d. SPP shape                         OK")
 
 # ---- 5. multi-task compute_loss path -------------------------------------
 model.zero_grad()

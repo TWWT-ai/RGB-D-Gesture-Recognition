@@ -11,15 +11,25 @@ from utils import GRIDS, split_anchors_by_scale     # >>> [YOLOv3-NEW]
 # >>> [YOLOv3-NEW] written into every checkpoint. A YOLOv2 checkpoint has a
 # completely different detection head, so loading one here should fail with a
 # sentence, not with 40 lines of "unexpected key in state_dict".
-ARCH = "yolov3"
+ARCH = "yolov4"     # >>> [YOLOv4-CHANGED]
 
-def conv_block(channel_in, channel_out, k=3, s=1):
+# >>> [YOLOv4-NEW] YOLOv4's backbone (CSPDarknet53) uses Mish,
+# x * tanh(softplus(x)), instead of LeakyReLU. It is smooth and lets a little
+# negative signal through, which the paper found worth ~+1% top-1 on the
+# backbone. The neck and the other heads keep LeakyReLU, as in YOLOv4.
+def activation(name="leaky"):
+    if name == "mish":
+        return nn.Mish(inplace=True)
+    return nn.LeakyReLU(0.1, inplace=True)
+
+
+def conv_block(channel_in, channel_out, k=3, s=1, act="leaky"):     # >>> [YOLOv4-CHANGED] added `act`
     # s=1 only thickening, s=2 shrinking and thickening
     return nn.Sequential(
         # Converting the picture into thinkened and shrinked picture
         nn.Conv2d(channel_in, channel_out, k, stride=s, padding=(k // 2), bias=False),
         nn.BatchNorm2d(channel_out),
-        nn.LeakyReLU(0.1, inplace=True)
+        activation(act)
     )
 
 
@@ -29,25 +39,60 @@ class ResidualBlock(nn.Module):
     # restores them, then the input is ADDED back. The shortcut gives the
     # gradient a straight road back to the early layers, which is what let
     # YOLOv3 go from Darknet-19 (no shortcuts) to a 53-layer backbone.
-    def __init__(self, channels):
+    # >>> [YOLOv4-CHANGED] `hidden` and `act` added: inside a CSP stage the
+    # block does not squeeze (hidden = channels), and the backbone uses Mish.
+    def __init__(self, channels, hidden=None, act="leaky"):
         super().__init__()
+        hidden = channels // 2 if hidden is None else hidden
         self.net = nn.Sequential(
-            conv_block(channels, channels // 2, k=1),
-            conv_block(channels // 2, channels, k=3),
+            conv_block(channels, hidden, k=1, act=act),
+            conv_block(hidden, channels, k=3, act=act),
         )
 
     def forward(self, x):
         return x + self.net(x)
 
 
+class CSPStage(nn.Module):
+    # >>> [YOLOv4-NEW] Cross Stage Partial stage (CSPNet), replacing YOLOv3's
+    # plain Darknet stage.
+    #
+    #   x --stride-2 conv--+--1x1--> residual blocks --1x1--+
+    #                      |                                concat --1x1--> out
+    #                      +--1x1-------------------------- +
+    #
+    # Only HALF the channels go through the residual blocks; the other half
+    # skips the whole stage and is concatenated back at the end. The blocks
+    # therefore cost about half as much, and the gradient reaching the early
+    # layers comes through two different routes, so the stage does not keep
+    # learning the same thing twice. CSPNet reports similar or better accuracy
+    # at noticeably lower compute.
+    def __init__(self, channel_in, channel_out, n_blocks, act="mish"):
+        super().__init__()
+        half = channel_out // 2
+        self.down = conv_block(channel_in, channel_out, s=2, act=act)
+        self.part1 = conv_block(channel_out, half, k=1, act=act)       # cross-stage route
+        self.part2 = nn.Sequential(
+            conv_block(channel_out, half, k=1, act=act),
+            *[ResidualBlock(half, hidden=half, act=act) for _ in range(n_blocks)],
+            conv_block(half, half, k=1, act=act),
+        )
+        self.transition = conv_block(2 * half, channel_out, k=1, act=act)
+
+    def forward(self, x):
+        x = self.down(x)
+        return self.transition(th.cat([self.part2(x), self.part1(x)], dim=1))
+
+
 def stage(channel_in, channel_out, n_blocks):
-    # >>> [YOLOv3-NEW] one Darknet-53 stage: a stride-2 conv halves the
-    # resolution, then n residual blocks refine at that resolution.
-    return nn.Sequential(conv_block(channel_in, channel_out, s=2),
-                         *[ResidualBlock(channel_out) for _ in range(n_blocks)])
+    # >>> [YOLOv4-CHANGED] was a plain Darknet-53 stage (YOLOv3); now CSP + Mish
+    return CSPStage(channel_in, channel_out, n_blocks, act="mish")
 
 
 class Backbone(nn.Module):
+    # >>> [YOLOv4-CHANGED] each stage is now a CSPStage with Mish (CSPDarknet53).
+    # Resolutions / channels / outputs are still identical, so nothing that
+    # reads f56..f7 has to change.
     # >>> [YOLOv3-CHANGED] Was: each stage = stride-2 conv + one plain 3x3 conv.
     # Now: each stage = stride-2 conv + `depths[i]` residual blocks
     # (Darknet-53 style). Resolutions and channel counts are UNCHANGED, so the
@@ -89,34 +134,65 @@ def conv_set(channel_in, channel_mid):
     )
 
 
-class FPNNeck(nn.Module):
-    # >>> [YOLOv3-NEW] YOLOv3's top-down feature pyramid.
-    # The 7x7 map knows WHAT is in the image (deep, big receptive field) but
-    # has lost WHERE things are to within 64 px. The 28x28 map is the other
-    # way round. So the deep map is upsampled and concatenated onto the
-    # shallower ones: every scale gets both the semantics and the resolution.
+class SPP(nn.Module):
+    # >>> [YOLOv4-NEW] Spatial Pyramid Pooling block (YOLOv4's SPP, from
+    # YOLOv3-SPP). Max-pool the deepest map with 5x5, 9x9 and 13x13 windows at
+    # stride 1 and stack the results with the input. On a 7x7 map a 13x13
+    # window covers the whole image, so every cell of the 7x7 grid now also
+    # sees a global summary of the frame, at almost zero extra cost.
+    def __init__(self, pools=(5, 9, 13)):
+        super().__init__()
+        self.pools = nn.ModuleList(nn.MaxPool2d(k, stride=1, padding=k // 2) for k in pools)
+
+    def forward(self, x):
+        return th.cat([x] + [pool(x) for pool in self.pools], dim=1)
+
+
+class PANNeck(nn.Module):
+    # >>> [YOLOv4-NEW] replaces YOLOv3's FPNNeck: SPP on top, then PANet.
     #
-    #   f7  -> conv_set -> p7 ------------------------------------> 7x7 head
-    #              |
-    #              1x1, upsample x2, concat f14 -> conv_set -> p14 -> 14x14 head
-    #                                                 |
-    #                  1x1, upsample x2, concat f28 -> conv_set -> p28 -> 28x28 head
+    # YOLOv3's FPN only goes top-down, so the 7x7 head never sees the precise
+    # low-level detail from f28. PANet adds a second, bottom-up path after the
+    # top-down one, so localisation detail flows back up to the coarse grid
+    # through only a couple of layers. YOLOv4 merges paths by CONCATENATION
+    # (its "modified PAN") instead of PANet's addition.
+    #
+    #   f7 -> conv_set -> SPP -> conv_set -> p7 -----------------------> concat -> conv_set -> n7  (7x7 head)
+    #                                        |                            ^
+    #                                        1x1, up x2                   stride-2 conv
+    #                                        v                            |
+    #   f14 -> 1x1 --------------------> concat -> conv_set -> t14 ----> concat -> conv_set -> n14 (14x14 head)
+    #                                                          |          ^
+    #                                                          1x1, up x2 stride-2 conv
+    #                                                          v          |
+    #   f28 -> 1x1 --------------------------------------> concat -> conv_set -> n28              (28x28 head)
     def __init__(self):
         super().__init__()
-        self.set7 = conv_set(1024, 512)
+        # top of the pyramid + SPP
+        self.pre7 = conv_set(1024, 512)
+        self.spp = SPP()
+        self.post7 = conv_set(512 * 4, 512)
+        # top-down
         self.lat7 = conv_block(512, 256, k=1)
-        self.set14 = conv_set(256 + 512, 256)
+        self.in14 = conv_block(512, 256, k=1)
+        self.td14 = conv_set(256 + 256, 256)
         self.lat14 = conv_block(256, 128, k=1)
-        self.set28 = conv_set(128 + 256, 128)
-        self.out_channels = (512, 256, 128)    # p7, p14, p28
+        self.in28 = conv_block(256, 128, k=1)
+        self.td28 = conv_set(128 + 128, 128)
+        # bottom-up
+        self.down28 = conv_block(128, 256, s=2)
+        self.bu14 = conv_set(256 + 256, 256)
+        self.down14 = conv_block(256, 512, s=2)
+        self.bu7 = conv_set(512 + 512, 512)
+        self.out_channels = (512, 256, 128)    # n7, n14, n28
 
     def forward(self, f28, f14, f7):
-        p7 = self.set7(f7)
-        x = F.interpolate(self.lat7(p7), scale_factor=2)
-        p14 = self.set14(th.cat([x, f14], dim=1))
-        x = F.interpolate(self.lat14(p14), scale_factor=2)
-        p28 = self.set28(th.cat([x, f28], dim=1))
-        return p7, p14, p28
+        p7 = self.post7(self.spp(self.pre7(f7)))
+        t14 = self.td14(th.cat([F.interpolate(self.lat7(p7), scale_factor=2), self.in14(f14)], dim=1))
+        n28 = self.td28(th.cat([F.interpolate(self.lat14(t14), scale_factor=2), self.in28(f28)], dim=1))
+        n14 = self.bu14(th.cat([self.down28(n28), t14], dim=1))
+        n7 = self.bu7(th.cat([self.down14(n14), p7], dim=1))
+        return n7, n14, n28
 
 
 class DetectionHead(nn.Module):
@@ -140,6 +216,16 @@ class DetectionHead(nn.Module):
     # S. All boxes from all grids are then flattened into one [N, M, 5]
     # tensor of (cx, cy, w, h, conf) in [0, 1], so evaluate.py, visualize.py
     # and the web demo still just pick the most confident row.
+    #
+    # >>> [YOLOv4-CHANGED] "eliminate grid sensitivity":
+    #   bx = (scale_xy * sigmoid(tx) - (scale_xy - 1) / 2 + col) / S
+    # With a plain sigmoid, a hand whose centre sits exactly on a cell border
+    # needs sigmoid(tx) = 0 or 1, i.e. tx = -inf / +inf, which the network can
+    # never output. Stretching the sigmoid slightly past [0, 1] makes the
+    # border reachable with finite tx. YOLOv4's configs use 1.2 / 1.1 / 1.05
+    # from the finest to the coarsest grid (finer grid = more borders).
+    SCALE_XY = {7: 1.05, 14: 1.1, 28: 1.2}
+
     def __init__(self, B=2, anchors=None, in_channels=(512, 256, 128), grids=GRIDS):
         super().__init__()
         # `B` is kept only so old call sites do not crash; the real count is
@@ -212,8 +298,9 @@ class DetectionHead(nn.Module):
         A = anchors.size(0)
         cols = th.arange(S, device=t.device, dtype=t.dtype).view(1, 1, S, 1)
         rows = th.arange(S, device=t.device, dtype=t.dtype).view(1, S, 1, 1)
-        cx = (th.sigmoid(t[..., 0]) + cols) / S
-        cy = (th.sigmoid(t[..., 1]) + rows) / S
+        sxy = self.SCALE_XY.get(S, 1.0)     # >>> [YOLOv4-CHANGED]
+        cx = (sxy * th.sigmoid(t[..., 0]) - (sxy - 1) / 2 + cols) / S
+        cy = (sxy * th.sigmoid(t[..., 1]) - (sxy - 1) / 2 + rows) / S
         # clamp before exp: an untrained network can emit large values and
         # exp() would overflow to inf, which poisons the whole loss.
         aw = anchors[:, 0].view(1, 1, 1, A).to(t.dtype)
@@ -294,7 +381,7 @@ class HandGestureNet(nn.Module):
         # >>> [YOLOv3-NEW] the neck only feeds detection. Segmentation keeps its
         # own U-Net decoder and classification keeps reading f7, so neither of
         # those heads changes behaviour because of the new detector.
-        self.neck = FPNNeck()
+        self.neck = PANNeck()     # >>> [YOLOv4-CHANGED] was FPNNeck
         self.detecting_head = DetectionHead(B, anchors, in_channels=self.neck.out_channels)   # >>> [YOLOv3-CHANGED]
         # >>> [YOLOv2-NEW] convenience handle for train.py / evaluate.py
         self.anchors_list = self.detecting_head.anchors_list

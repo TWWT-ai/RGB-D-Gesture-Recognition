@@ -1,4 +1,5 @@
 import torch as th
+import math
 
 # Grid of the dataloader's TARGET container (encode_yolo_target). Since YOLOv3
 # the network predicts on several grids (see GRIDS), but the dataset still
@@ -129,6 +130,52 @@ def compute_intersection_over_union(box1, box2):
     # Calculating union
     union = box1[..., 2] * box1[..., 3] + box2[..., 2] * box2[..., 3] - inter
     return inter / (union + 1e-6)
+
+
+# >>> [YOLOv4-NEW]
+def bbox_ciou(box1, box2, eps=1e-7):
+    """
+    Complete-IoU between boxes in (cx, cy, w, h) format, broadcastable.
+
+        CIoU = IoU - rho^2 / c^2 - alpha * v
+
+    IoU      overlap, as before
+    rho^2/c^2  squared centre distance over the squared diagonal of the
+             smallest box enclosing both -> still gives a gradient when the
+             boxes do NOT overlap at all, where plain IoU is flat zero
+    v        how different the two aspect ratios are,
+             (4 / pi^2) * (atan(w_gt / h_gt) - atan(w / h))^2
+    alpha    v / ((1 - IoU) + v), so the aspect term only takes over once the
+             boxes already overlap
+
+    YOLOv4 trains the box with loss = 1 - CIoU instead of MSE on x, y, w, h.
+    MSE treats the four numbers as independent, but the metric we are judged
+    on (IoU) is not: a 5 px error is huge on a small hand and nothing on a big
+    one. CIoU optimises the overlap directly and is scale-invariant.
+    Range: [-1, 1], 1 = identical boxes.
+    """
+    b1_x1, b1_x2 = box1[..., 0] - box1[..., 2] / 2, box1[..., 0] + box1[..., 2] / 2
+    b1_y1, b1_y2 = box1[..., 1] - box1[..., 3] / 2, box1[..., 1] + box1[..., 3] / 2
+    b2_x1, b2_x2 = box2[..., 0] - box2[..., 2] / 2, box2[..., 0] + box2[..., 2] / 2
+    b2_y1, b2_y2 = box2[..., 1] - box2[..., 3] / 2, box2[..., 1] + box2[..., 3] / 2
+
+    inter = ((th.min(b1_x2, b2_x2) - th.max(b1_x1, b2_x1)).clamp(min=0) *
+             (th.min(b1_y2, b2_y2) - th.max(b1_y1, b2_y1)).clamp(min=0))
+    w1, h1 = box1[..., 2], box1[..., 3] + eps
+    w2, h2 = box2[..., 2], box2[..., 3] + eps
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # smallest enclosing box
+    cw = th.max(b1_x2, b2_x2) - th.min(b1_x1, b2_x1)
+    ch = th.max(b1_y2, b2_y2) - th.min(b1_y1, b2_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+    rho2 = (box1[..., 0] - box2[..., 0]) ** 2 + (box1[..., 1] - box2[..., 1]) ** 2
+
+    v = (4 / math.pi ** 2) * (th.atan(w2 / h2) - th.atan(w1 / h1)) ** 2
+    with th.no_grad():
+        alpha = v / (v - iou + (1 + eps))
+    return iou - (rho2 / c2 + v * alpha)
 
 
 def encode_yolo_target(boundary_box, s=S):

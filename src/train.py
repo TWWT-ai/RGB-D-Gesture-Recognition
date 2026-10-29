@@ -12,6 +12,7 @@ from dataloader import HandGestureDataset
 from model import HandGestureNet, ARCH     # >>> [YOLOv3-CHANGED]
 from utils import compute_intersection_over_union
 from utils import shape_iou, anchor_tensor, ANCHORS     # >>> [YOLOv2-NEW]
+from utils import bbox_ciou     # >>> [YOLOv4-NEW]
 # Grid size
 S = 7
 
@@ -38,33 +39,56 @@ def _bce(p, y, eps=1e-7):
     return -(y * th.log(p + eps) + (1 - y) * th.log(1 - p + eps))
 
 
-def yolo_detection_loss(prediction, target, layout, lambda_coord=1.0, lambda_obj=1.0,
-                        lambda_noobj=1.0, ignore_thresh=0.5):
+def assign_targets(gt, layout, iou_thresh=0.213):
     """
-    >>> [YOLOv3-CHANGED] rewritten for three grids and logistic objectness.
+    >>> [YOLOv4-NEW] Which (image, anchor, cell) predictions are POSITIVES?
+
+    YOLOv3: exactly one -- the anchor with the best shape-IoU.
+    YOLOv4: the best one AND every other anchor whose shape-IoU with the
+    ground truth is above `iou_thresh` (YOLOv4's cfg value is 0.213), each
+    in the cell of ITS OWN grid that holds the centre. A hand that sits
+    between two anchor sizes now trains both instead of only one, which gives
+    more positive samples per image -- useful when only ~900 frames have boxes.
+
+    gt: [n, 4] (cx, cy, w, h). Returns (box_idx, anchor, flat) for every positive,
+    where box_idx indexes into gt and flat into the [M] predictions of that image.
+    """
+    anchors = layout["anchors"].to(gt.dtype)
+    siou = shape_iou(gt[:, 2:4], anchors)                       # [n, A]
+    pos = siou > iou_thresh
+    pos[th.arange(gt.size(0), device=gt.device), siou.argmax(dim=1)] = True
+    box_idx, anchor = th.nonzero(pos, as_tuple=True)
+    g = gt[box_idx]
+    S_a = layout["grid"][anchor]
+    # Which cell of THAT grid holds the centre? min() guards cx == 1.0.
+    col = th.minimum((g[:, 0] * S_a).long(), S_a - 1)
+    row = th.minimum((g[:, 1] * S_a).long(), S_a - 1)
+    flat = layout["offset"][anchor] + (row * S_a + col) * layout["count"][anchor] + layout["local"][anchor]
+    return box_idx, anchor, flat
+
+
+def yolo_detection_loss(prediction, target, layout, lambda_box=1.0, lambda_obj=1.0,
+                        lambda_noobj=1.0, ignore_thresh=0.7, iou_thresh=0.213):
+    """
+    >>> [YOLOv4-CHANGED] (on top of the YOLOv3 version)
 
         Steps:
         1. Read the one ground-truth box per image out of the target ->
-        2. Pick the responsible ANCHOR by shape over ALL 3 scales (YOLOv2's
-           rule, but now the winning anchor also decides the GRID) ->
-        3. Find the flat index of (that anchor, the cell holding the centre) ->
-        4. Box terms on that one prediction, objectness on every prediction ->
+        2. assign_targets(): best anchor + every anchor above iou_thresh,
+           each on its own grid ->
+        3. Box term = 1 - CIoU on every positive ->
+        4. Objectness BCE on every prediction (1 for positives, 0 for the
+           rest, ignored if IoU > ignore_thresh) ->
         5. Weighted sum
 
-    What is YOLOv3 about this, compared with the YOLOv2 version:
-    - Scale choice is part of the assignment. A big hand matches a big anchor,
-      which lives on the 7x7 grid; a small hand ends up on the 28x28 grid.
-    - Objectness is BINARY CROSS-ENTROPY with target 1 / 0 ("logistic
-      regression" in the paper), not MSE towards the IoU. MSE on a sigmoid has
-      a vanishing gradient exactly when the prediction is confidently wrong.
-    - IGNORE threshold: a non-responsible prediction that already overlaps the
-      hand with IoU > ignore_thresh is neither pushed up nor down. Without it,
-      a perfectly good second box on the neighbouring anchor gets punished as
-      "background", which fights the responsible box.
-    - Box size is weighted by (2 - w*h), YOLOv3's replacement for YOLOv1's
-      square-root trick: small boxes count up to 2x, big boxes ~1x.
-    - The lambdas are 1 by default: YOLOv3 dropped YOLOv1's 5 / 0.5, because
-      with BCE the background terms shrink on their own once they are right.
+    What changed from YOLOv3:
+    - Box loss: MSE on (offset, log w/h) -> 1 - CIoU (see utils.bbox_ciou).
+      CIoU is already scale-invariant, so YOLOv3's (2 - w*h) weight is gone.
+    - Several positives per hand (iou_thresh), not one.
+    - ignore_thresh 0.5 -> 0.7, YOLOv4's cfg value. With more positives the
+      model produces more decent boxes, and only really good non-positive
+      ones should escape the background penalty.
+    Kept from YOLOv3: BCE objectness, lambdas of 1.
     """
     N, M, _ = prediction.shape
     gt = gt_boxes_from_target(target)                     # [N, 5]
@@ -85,40 +109,22 @@ def yolo_detection_loss(prediction, target, layout, lambda_coord=1.0, lambda_obj
         ignore = (iou_all > ignore_thresh) & has_box[:, None]
     obj_weight = obj_weight.masked_fill(ignore, 0.0)
 
-    # ---- step 2/3: responsible anchor -> grid -> cell -> flat index ----
-    anchors = layout["anchors"].to(prediction.dtype)
+    # ---- step 2: positives ----
     idx = th.nonzero(has_box).squeeze(1)
-    g = gt[idx]
-    best = shape_iou(g[:, 2:4], anchors).argmax(dim=1)
-    S_b = layout["grid"][best]
-    # Which cell of THAT grid holds the centre? min() guards cx == 1.0.
-    col = th.minimum((g[:, 0] * S_b).long(), S_b - 1)
-    row = th.minimum((g[:, 1] * S_b).long(), S_b - 1)
-    flat = layout["offset"][best] + (row * S_b + col) * layout["count"][best] + layout["local"][best]
+    box_idx, _, flat = assign_targets(gt[idx, :4], layout, iou_thresh)
+    img = idx[box_idx]
 
-    obj_target[idx, flat] = 1.0
-    obj_weight[idx, flat] = lambda_obj
+    obj_target[img, flat] = 1.0
+    obj_weight[img, flat] = lambda_obj
     loss_obj = (obj_weight * _bce(conf, obj_target)).sum()
 
-    # ---- step 4: box terms on the responsible prediction only ----
-    response = prediction[idx, flat]                      # [n, 5]
-    Sf = S_b.to(prediction.dtype)
-    scale = 2.0 - g[:, 2] * g[:, 3]                       # (2 - w*h)
-
-    # Centre in CELL units (offset inside the cell, in [0, 1]), like YOLOv2.
-    pred_off = th.stack([response[:, 0] * Sf - col, response[:, 1] * Sf - row], dim=1)
-    gt_off = th.stack([g[:, 0] * Sf - col, g[:, 1] * Sf - row], dim=1)
-    loss_xy = (scale[:, None] * (pred_off - gt_off) ** 2).sum()
-
-    # Size in LOG space relative to the anchor, i.e. on tw / th directly, as
-    # YOLOv3 does. log(w / anchor_w) is exactly the (clamped) tw the head used.
-    aw = anchors[best]
-    pred_twh = th.log(response[:, 2:4].clamp(min=1e-6) / aw)
-    gt_twh = th.log(g[:, 2:4].clamp(min=1e-6) / aw)
-    loss_wh = (scale[:, None] * (pred_twh - gt_twh) ** 2).sum()
+    # ---- step 3: CIoU on every positive ----
+    response = prediction[img, flat]                      # [n_pos, 5]
+    ciou = bbox_ciou(response[:, :4], gt[img, :4])
+    loss_box = (1.0 - ciou).sum()
 
     # Returning Multi Part loss function
-    return (lambda_coord * (loss_xy + loss_wh) + loss_obj) / N
+    return (lambda_box * loss_box + loss_obj) / N
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0,
@@ -312,6 +318,14 @@ def main():
     # Checkpoint rule: cls_acc must improve AND seg/det val losses must stay
     # within (1 + best-tol) of the best they have ever been
     parser.add_argument("--best-tol", type=float, default=0.15)
+    # >>> [YOLOv4-NEW] class label smoothing, from YOLOv4's "bag of freebies".
+    # Target becomes 0.9 for the true gesture and 0.1/9 for the others, so the
+    # classifier is not pushed towards infinitely confident logits on the
+    # training people -- a cheap regulariser for the unseen-person test.
+    # YOLOv4 applies it to the detector's class scores; here the detector has
+    # one class (hand), so it goes on the gesture ClassificationHead instead.
+    # --label-smoothing 0 gives back the exact YOLOv3-branch behaviour.
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # >>> [YOLOv2-NEW] anchors from a file beat anchors hand-pasted into utils.py:
@@ -378,7 +392,7 @@ def main():
     for S_i, group in zip(model.detecting_head.grids, model.detecting_head.groups):
         print(f"  {S_i:>2}x{S_i:<2} grid: {[(round(a, 3), round(b, 3)) for a, b in group]}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
-    classification_criterion = nn.CrossEntropyLoss()
+    classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)     # >>> [YOLOv4-CHANGED]
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
