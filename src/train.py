@@ -9,7 +9,7 @@ import json
 
 from dataloader import get_dataLoaders
 from dataloader import HandGestureDataset
-from model import HandGestureNet
+from model import HandGestureNet, ARCH     # >>> [YOLOv3-CHANGED]
 from utils import compute_intersection_over_union
 from utils import shape_iou, anchor_tensor, ANCHORS     # >>> [YOLOv2-NEW]
 # Grid size
@@ -19,89 +19,110 @@ S = 7
 # Loss Function
 #---------------------------------------------------
 
-def yolo_detection_loss(prediction, target, B=None, lambda_coord=5.0, lambda_noobj=0.5,
-                        anchors=None):
+def gt_boxes_from_target(target):
     """
+    >>> [YOLOv3-NEW] The dataset still stores its single box in the old 7x7
+    container (encode_yolo_target). Pull the (cx, cy, w, h, has_box) row back
+    out, one per image: [N, S, S, 5] -> [N, 5].
+    """
+    flat = target.reshape(target.size(0), -1, 5)
+    idx = flat[..., 4].argmax(dim=1)
+    return flat[th.arange(flat.size(0), device=flat.device), idx]
+
+
+def _bce(p, y, eps=1e-7):
+    # BCE on a probability. The head hands out sigmoid(t), not t, so this is
+    # written out by hand with an eps instead of clamping p: a clamp would zero
+    # the gradient of a positive that is stuck near p = 0, which is exactly the
+    # case that most needs one.
+    return -(y * th.log(p + eps) + (1 - y) * th.log(1 - p + eps))
+
+
+def yolo_detection_loss(prediction, target, layout, lambda_coord=1.0, lambda_obj=1.0,
+                        lambda_noobj=1.0, ignore_thresh=0.5):
+    """
+    >>> [YOLOv3-CHANGED] rewritten for three grids and logistic objectness.
+
         Steps:
-        1. Split cells into two groups ->
-        2. Push confidence toward zero for no-object cells ->
-        3. Responsible-box selection ->
-        4. Computing the three loss term: xy, wh, conf ->
+        1. Read the one ground-truth box per image out of the target ->
+        2. Pick the responsible ANCHOR by shape over ALL 3 scales (YOLOv2's
+           rule, but now the winning anchor also decides the GRID) ->
+        3. Find the flat index of (that anchor, the cell holding the centre) ->
+        4. Box terms on that one prediction, objectness on every prediction ->
         5. Weighted sum
 
-    >>> [YOLOv2-CHANGED] Step 3 is the part that changed.
-    YOLOv1 picked the responsible box by asking which of the B PREDICTIONS
-    currently overlaps the ground truth best. That is circular: at epoch 1 the
-    predictions are noise, so the choice is noise, and two boxes can keep
-    swapping roles for many epochs.
-    YOLOv2 picks it by asking which ANCHOR has the closest SHAPE to the
-    ground-truth box. The anchors never change during training, so a
-    tall-thin hand is always handled by the tall-thin anchor. Each anchor
-    gets to specialise instead of all of them chasing the average box.
+    What is YOLOv3 about this, compared with the YOLOv2 version:
+    - Scale choice is part of the assignment. A big hand matches a big anchor,
+      which lives on the 7x7 grid; a small hand ends up on the 28x28 grid.
+    - Objectness is BINARY CROSS-ENTROPY with target 1 / 0 ("logistic
+      regression" in the paper), not MSE towards the IoU. MSE on a sigmoid has
+      a vanishing gradient exactly when the prediction is confidently wrong.
+    - IGNORE threshold: a non-responsible prediction that already overlaps the
+      hand with IoU > ignore_thresh is neither pushed up nor down. Without it,
+      a perfectly good second box on the neighbouring anchor gets punished as
+      "background", which fights the responsible box.
+    - Box size is weighted by (2 - w*h), YOLOv3's replacement for YOLOv1's
+      square-root trick: small boxes count up to 2x, big boxes ~1x.
+    - The lambdas are 1 by default: YOLOv3 dropped YOLOv1's 5 / 0.5, because
+      with BCE the background terms shrink on their own once they are right.
     """
+    N, M, _ = prediction.shape
+    gt = gt_boxes_from_target(target)                     # [N, 5]
+    has_box = gt[:, 4] > 0.5
+    conf = prediction[..., 4]                             # [N, M]
 
-    N = prediction.size(0)
-    # >>> [YOLOv2-CHANGED] B is the anchor count now; read it off the tensor
-    # so it can never disagree with the head.
-    if B is None:
-        B = prediction.shape[-1] // 5
-    if anchors is None:
-        anchors = anchor_tensor(ANCHORS, device=prediction.device, dtype=prediction.dtype)
-    anchors = anchors.to(device=prediction.device, dtype=prediction.dtype)
-    # Unzip the combined last index back to Box (B) and (x, y, w, h, confidence)
-    prediction = prediction.view(N, S, S, B, 5)
+    # ---- objectness targets: 0 everywhere to start with ----
+    obj_target = th.zeros_like(conf)
+    obj_weight = th.full_like(conf, lambda_noobj)
 
-    # Detect whether there is an object within the boxes
-    object_mask = target[..., 4] > 0.5
-    no_object_mask = ~object_mask             # Flipping the mask
-
-    # Selecting total numbers of all the boxes with the object and the confidence of the object
-    no_object_conf = prediction[no_object_mask][..., 4]
-    # Creating a no_object_conf size like (assumed correct answer) but filled with 0, containing all cells without object
-    # Anything not equal to 0 will be considered loss/wrong prediction, to reduce the falseness reflected on to the last model
-    loss_no_object = F.mse_loss(no_object_conf, th.zeros_like(no_object_conf), reduction="sum")
-
-    if object_mask.sum() == 0:
+    if has_box.sum() == 0:
         # Safety check
-        return lambda_noobj * loss_no_object / N
+        return (obj_weight * _bce(conf, obj_target)).sum() / N
 
-    # If there is something within the box
-    prediction_object = prediction[object_mask]
-    target_object = target[object_mask]
+    # Ignore mask: predicted boxes already overlapping the truth well enough.
+    with th.no_grad():
+        iou_all = compute_intersection_over_union(prediction[..., :4], gt[:, None, :4])
+        ignore = (iou_all > ignore_thresh) & has_box[:, None]
+    obj_weight = obj_weight.masked_fill(ignore, 0.0)
 
-    # >>> [YOLOv2-CHANGED] responsible box = best SHAPE match to an anchor.
-    # Was: argmax over IoU of the current predictions (see docstring).
-    best_idx = shape_iou(target_object[:, 2:4], anchors).argmax(dim=1)
+    # ---- step 2/3: responsible anchor -> grid -> cell -> flat index ----
+    anchors = layout["anchors"].to(prediction.dtype)
+    idx = th.nonzero(has_box).squeeze(1)
+    g = gt[idx]
+    best = shape_iou(g[:, 2:4], anchors).argmax(dim=1)
+    S_b = layout["grid"][best]
+    # Which cell of THAT grid holds the centre? min() guards cx == 1.0.
+    col = th.minimum((g[:, 0] * S_b).long(), S_b - 1)
+    row = th.minimum((g[:, 1] * S_b).long(), S_b - 1)
+    flat = layout["offset"][best] + (row * S_b + col) * layout["count"][best] + layout["local"][best]
 
-    # Fancy indexing: using the selected best
-    response = prediction_object[th.arange(prediction_object.size(0)), best_idx]
+    obj_target[idx, flat] = 1.0
+    obj_weight[idx, flat] = lambda_obj
+    loss_obj = (obj_weight * _bce(conf, obj_target)).sum()
 
-    # >>> [YOLOv2-NEW] the confidence target is still "how well does the box
-    # you actually predicted overlap the truth", so we still need that IoU --
-    # we just no longer use it to CHOOSE the box.
-    best_iou = compute_intersection_over_union(response[:, :4], target_object[:, :4])
+    # ---- step 4: box terms on the responsible prediction only ----
+    response = prediction[idx, flat]                      # [n, 5]
+    Sf = S_b.to(prediction.dtype)
+    scale = 2.0 - g[:, 2] * g[:, 3]                       # (2 - w*h)
 
-    # Calculating loss
-    # NOTE the * S. response[:, 0:2] is (sigmoid(t) + cell_index) / S, i.e. a
-    # WHOLE-IMAGE coordinate, but both YOLOv1 and YOLOv2 weigh this term in
-    # CELL-RELATIVE units. Without the rescale the squared error is S^2 = 49x too
-    # small, so lambda_coord=5.0 was really behaving like ~0.1 and the centre
-    # regression was being drowned out by the confidence terms.
-    loss_xy = F.mse_loss(response[:, 0:2] * S, target_object[:, 0:2] * S, reduction="sum")
-    # Square root would punish small boundary boxes more 
-    loss_wh = F.mse_loss(
-        th.sqrt(response[:, 2:4].clamp(min=1e-6)),
-        th.sqrt(target_object[:, 2:4].clamp(min=1e-6)),
-        reduction="sum",
-    )
-    loss_confidence = F.mse_loss(response[:, 4], best_iou.detach(), reduction="sum")
+    # Centre in CELL units (offset inside the cell, in [0, 1]), like YOLOv2.
+    pred_off = th.stack([response[:, 0] * Sf - col, response[:, 1] * Sf - row], dim=1)
+    gt_off = th.stack([g[:, 0] * Sf - col, g[:, 1] * Sf - row], dim=1)
+    loss_xy = (scale[:, None] * (pred_off - gt_off) ** 2).sum()
+
+    # Size in LOG space relative to the anchor, i.e. on tw / th directly, as
+    # YOLOv3 does. log(w / anchor_w) is exactly the (clamped) tw the head used.
+    aw = anchors[best]
+    pred_twh = th.log(response[:, 2:4].clamp(min=1e-6) / aw)
+    gt_twh = th.log(g[:, 2:4].clamp(min=1e-6) / aw)
+    loss_wh = (scale[:, None] * (pred_twh - gt_twh) ** 2).sum()
 
     # Returning Multi Part loss function
-    return (lambda_coord * (loss_xy + loss_wh) + loss_confidence + lambda_noobj * loss_no_object) / N
+    return (lambda_coord * (loss_xy + loss_wh) + loss_obj) / N
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0,
-                 anchors=None):     # >>> [YOLOv2-NEW]
+                 layout=None):     # >>> [YOLOv3-CHANGED] anchors -> full multi-scale layout
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
 
@@ -113,7 +134,7 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
     has_mask = targets["has_mask"].bool()
     if has_mask.any():
         loss_detection = yolo_detection_loss(detection_pred[has_mask], targets["det"][has_mask],
-                                             anchors=anchors)     # >>> [YOLOv2-NEW]
+                                             layout)     # >>> [YOLOv3-CHANGED]
         loss_segmentation = segmentation_criterion(segmentation_pred[has_mask],
                                                    targets["Mask"][has_mask].float())
     else:
@@ -161,7 +182,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
     model.train()
     # >>> [YOLOv2-NEW] read the anchors off the model, so the loss can never
     # be matched against a different anchor set from the one the head decoded with
-    anchors = model.detecting_head.anchors
+    # >>> [YOLOv3-CHANGED] ...together with which grid each anchor lives on
+    layout = model.detecting_head.layout()
     # Accumulate ON DEVICE as tensors -- see the note in compute_loss. These are
     # only pulled back to the host once, after the whole epoch.
     zero = th.zeros((), device=device)
@@ -184,7 +206,7 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
         loss, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
                                    lambda_classification, lambda_detection,
-                                   anchors=anchors)     # >>> [YOLOv2-NEW]
+                                   layout=layout)     # >>> [YOLOv3-CHANGED]
 
         # Cleaning the previously loaded data first
         optimizer.zero_grad(set_to_none=True)
@@ -220,7 +242,7 @@ def validate(model, loader, segmentation_criterion,
             classification_criterion, device, lambda_segmentation,
             lambda_classification, lambda_detection=1.0, use_amp=False):
     model.eval()
-    anchors = model.detecting_head.anchors     # >>> [YOLOv2-NEW]
+    layout = model.detecting_head.layout()     # >>> [YOLOv3-CHANGED]
     zero = th.zeros((), device=device)
     running = {"det": zero.clone(),
               "seg": zero.clone(),
@@ -239,7 +261,7 @@ def validate(model, loader, segmentation_criterion,
         _, parts = compute_loss(outputs, targets, segmentation_criterion,
                                    classification_criterion, lambda_segmentation,
                                    lambda_classification, lambda_detection,
-                                   anchors=anchors)     # >>> [YOLOv2-NEW]
+                                   layout=layout)     # >>> [YOLOv3-CHANGED]
 
         # Adding the loss to the training model
         for k in running:
@@ -352,6 +374,9 @@ def main():
     model = HandGestureNet(in_channels=4, n_classes=10, anchors=anchors).to(device)
     print(f"Detection head: {len(anchors)} anchors (w, h, normalised) = "
           f"{[(round(a, 3), round(b, 3)) for a, b in anchors]}")
+    # >>> [YOLOv3-NEW] show which anchors went to which grid
+    for S_i, group in zip(model.detecting_head.grids, model.detecting_head.groups):
+        print(f"  {S_i:>2}x{S_i:<2} grid: {[(round(a, 3), round(b, 3)) for a, b in group]}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss()
     optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -409,6 +434,7 @@ def main():
                 "val_seg_loss": val_m["seg"],
                 "val_det_loss": val_m["det"],
                 "args": vars(args),
+                "arch": ARCH,     # >>> [YOLOv3-NEW]
                 "anchors": model.anchors_list,     # >>> [YOLOv2-NEW] weights are
                 # meaningless without the anchors they were decoded against, so
                 # they travel together in the same file
@@ -422,6 +448,7 @@ def main():
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": model.state_dict(),
+             "arch": ARCH,     # >>> [YOLOv3-NEW]
              "anchors": model.anchors_list},     # >>> [YOLOv2-NEW]
                output_directory / "last.pth")
     print("Training finished.")

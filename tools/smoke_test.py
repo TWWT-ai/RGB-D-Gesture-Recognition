@@ -1,5 +1,5 @@
-"""CPU smoke test for the YOLOv2 anchor port. Run from src/: python ../smoke_test.py"""
-import sys, os, math
+"""CPU smoke test for the YOLOv3 port. Run from src/: python ../tools/smoke_test.py"""
+import sys, os, math, tempfile
 _here = os.path.dirname(os.path.abspath(__file__))
 for _cand in (os.path.join(_here, "src"), os.path.join(_here, "..", "src")):
     if os.path.isdir(_cand):
@@ -11,70 +11,104 @@ else:
 import torch as th
 import numpy as np
 
-from utils import (ANCHORS, anchor_tensor, shape_iou, encode_yolo_target,
+from utils import (ANCHORS, GRIDS, anchor_tensor, shape_iou, encode_yolo_target,
                    decode_predictions, extract_best_pred_box, extract_gt_box,
-                   compute_intersection_over_union, S)
-from model import HandGestureNet, DetectionHead, load_handgesture_net
-from train import yolo_detection_loss, compute_loss
+                   compute_intersection_over_union, split_anchors_by_scale, S)
+from model import HandGestureNet, DetectionHead, load_handgesture_net, ARCH
+from train import yolo_detection_loss, compute_loss, gt_boxes_from_target
 import torch.nn as nn
 
 th.manual_seed(0)
 A = len(ANCHORS)
-print(f"A = {A} anchors")
+groups = split_anchors_by_scale(ANCHORS)
+M = sum(g * g * len(grp) for g, grp in zip(GRIDS, groups))
+print(f"A = {A} anchors over grids {GRIDS} as {[len(g) for g in groups]}, M = {M} boxes")
+
+# ---- 0. anchor split: biggest on the coarsest grid, nothing lost ----------
+assert sum(len(g) for g in groups) == A
+areas = [[w * h for w, h in g] for g in groups]
+for coarse, fine in zip(areas, areas[1:]):
+    assert min(coarse) >= max(fine), areas
+assert [len(g) for g in split_anchors_by_scale([(0.1 * i, 0.1 * i) for i in range(1, 10)])] == [3, 3, 3]
+print("0. anchor -> grid split               OK")
 
 # ---- 1. forward shape + ranges -------------------------------------------
 model = HandGestureNet(in_channels=4, n_classes=10, anchors=ANCHORS)
 x = th.randn(2, 4, 448, 448)
 det, seg, cls = model(x)
-assert det.shape == (2, S, S, A * 5), det.shape
+assert det.shape == (2, M, 5), det.shape
 assert seg.shape == (2, 1, 448, 448), seg.shape
 assert cls.shape == (2, 10), cls.shape
-d = det.view(2, S, S, A, 5)
+d = det
 assert th.isfinite(det).all()
 assert (d[..., 0] >= 0).all() and (d[..., 0] <= 1).all(), "cx out of [0,1]"
 assert (d[..., 1] >= 0).all() and (d[..., 1] <= 1).all(), "cy out of [0,1]"
 assert (d[..., 4] >= 0).all() and (d[..., 4] <= 1).all(), "conf out of [0,1]"
 assert (d[..., 2] > 0).all() and (d[..., 3] > 0).all(), "w/h must be positive"
+# objectness prior: everything starts near p = 0.01, not 0.5
+assert d[..., 4].mean() < 0.1, d[..., 4].mean()
 print("1. forward shapes + ranges           OK")
 
-# ---- 2. centre really is locked inside its own cell ----------------------
-# force huge raw t values -> sigmoid saturates -> centre must stay in the cell
-head = DetectionHead(anchors=ANCHORS)
+# ---- 2. centre really is locked inside its own cell, on every grid -------
+head = DetectionHead(anchors=ANCHORS, in_channels=model.neck.out_channels)
 with th.no_grad():
-    for m in head.net.modules():
+    for m in head.preds.modules():
         if isinstance(m, nn.Conv2d):
             m.weight.mul_(0)
             if m.bias is not None:
                 m.bias.mul_(0).add_(50.0)   # sigmoid -> ~1
-out = head(th.randn(1, 1024, S, S)).view(1, S, S, A, 5)
-for r in range(S):
-    for c in range(S):
-        cx, cy = out[0, r, c, 0, 0].item(), out[0, r, c, 0, 1].item()
-        assert c / S - 1e-4 <= cx <= (c + 1) / S + 1e-4, (r, c, cx)
-        assert r / S - 1e-4 <= cy <= (r + 1) / S + 1e-4, (r, c, cy)
-print("2. centre stays inside its own cell  OK")
+feats = [th.randn(1, c, g, g) for c, g in zip(model.neck.out_channels, GRIDS)]
+out = head(feats)
+lay = head.layout()
+for a in range(A):
+    Sa = int(lay["grid"][a]); off = int(lay["offset"][a])
+    cnt = int(lay["count"][a]); loc = int(lay["local"][a])
+    for r in range(Sa):
+        for c in range(Sa):
+            cx, cy = out[0, off + (r * Sa + c) * cnt + loc, :2].tolist()
+            assert c / Sa - 1e-4 <= cx <= (c + 1) / Sa + 1e-4, (a, r, c, cx)
+            assert r / Sa - 1e-4 <= cy <= (r + 1) / Sa + 1e-4, (a, r, c, cy)
+print("2. centre stays inside its own cell  OK (layout indices verified)")
 
 # ---- 3. anchor assignment is by shape, and is stable ---------------------
 anchors = anchor_tensor(ANCHORS)
 # an anchor handed to itself must select itself, whatever ANCHORS currently is
 idx = shape_iou(anchors, anchors).argmax(dim=1)
 assert idx.tolist() == list(range(A)), idx.tolist()
-# a box far bigger than every anchor must land on the largest one
-biggest = int(th.argmax(anchors[:, 0] * anchors[:, 1]))
-idx2 = shape_iou(th.tensor([[0.9, 0.9]]), anchors).argmax(dim=1)
-assert idx2.item() == biggest, (idx2.item(), biggest)
-print(f"3. shape-IoU assignment self-map + extremes  OK")
+# a box far bigger than every anchor must land on the largest one -> 7x7 grid
+idx2 = shape_iou(th.tensor([[0.9, 0.9]]), lay["anchors"]).argmax(dim=1)
+assert int(lay["grid"][idx2]) == GRIDS[0], int(lay["grid"][idx2])
+idx3 = shape_iou(th.tensor([[0.01, 0.01]]), lay["anchors"]).argmax(dim=1)
+assert int(lay["grid"][idx3]) == GRIDS[-1], int(lay["grid"][idx3])
+print(f"3. shape-IoU assignment picks the grid too  OK")
 
 # ---- 4. loss is finite and gradients flow --------------------------------
 target = th.zeros(2, S, S, 5)
 target[0] = encode_yolo_target([0.30, 0.35, 0.55, 0.70])   # x1,y1,x2,y2
 target[1] = encode_yolo_target([0.10, 0.10, 0.25, 0.30])
-loss = yolo_detection_loss(det, target)
+g = gt_boxes_from_target(target)
+assert th.allclose(g[0, :4], th.tensor([0.425, 0.525, 0.25, 0.35])), g
+loss = yolo_detection_loss(det, target, model.detecting_head.layout())
 assert th.isfinite(loss), loss
 loss.backward()
 gnorm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
 assert gnorm > 0 and math.isfinite(gnorm)
 print(f"4. det loss {loss.item():.4f}, grad norm {gnorm:.1f}   OK")
+
+# ---- 4b. a perfect prediction gives (almost) zero box loss ---------------
+lay = model.detecting_head.layout()
+fake = th.zeros(1, M, 5); fake[..., 2:4] = 0.1
+gt = th.tensor([0.43, 0.52, 0.2, 0.3])
+b = shape_iou(gt[None, 2:4], lay["anchors"]).argmax().item()
+Sg = int(lay["grid"][b]); col, row = int(gt[0] * Sg), int(gt[1] * Sg)
+fi = int(lay["offset"][b]) + (row * Sg + col) * int(lay["count"][b]) + int(lay["local"][b])
+fake[0, fi, :4] = gt; fake[0, fi, 4] = 1.0
+tgt = th.zeros(1, S, S, 5); tgt[0, 3, 3] = th.tensor([*gt.tolist(), 1.0])
+l_perfect = yolo_detection_loss(fake, tgt, lay).item()
+fake[0, fi, 0] += 0.02
+l_off = yolo_detection_loss(fake, tgt, lay).item()
+assert l_perfect < 1e-3 and l_off > l_perfect, (l_perfect, l_off)
+print(f"4b. perfect box -> loss {l_perfect:.2e}, nudged -> {l_off:.2e}   OK")
 
 # ---- 5. multi-task compute_loss path -------------------------------------
 model.zero_grad()
@@ -82,7 +116,7 @@ det, seg, cls = model(x)
 targets = {"det": target, "Mask": th.zeros(2, 1, 448, 448),
            "Label": th.tensor([1, 2]), "has_mask": th.tensor([1.0, 0.0])}
 total, parts = compute_loss((det, seg, cls), targets, nn.BCEWithLogitsLoss(),
-                            nn.CrossEntropyLoss(), anchors=model.detecting_head.anchors)
+                            nn.CrossEntropyLoss(), layout=model.detecting_head.layout())
 assert all(math.isfinite(v) for v in parts.values()), parts
 total.backward()
 print(f"5. compute_loss {parts}   OK")
@@ -91,24 +125,25 @@ print(f"5. compute_loss {parts}   OK")
 targets["has_mask"] = th.tensor([0.0, 0.0])
 t2, p2 = compute_loss((det.detach(), seg.detach(), cls.detach()), targets,
                       nn.BCEWithLogitsLoss(), nn.CrossEntropyLoss(),
-                      anchors=model.detecting_head.anchors)
+                      layout=model.detecting_head.layout())
 assert p2["det"] == 0.0
 print("6. batch with no annotated frame     OK")
 
-# ---- 7. downstream helpers infer A from the tensor -----------------------
+# ---- 7. downstream helpers work on the flat [M, 5] output ----------------
 boxes = decode_predictions(det[0].detach(), conf_thresh=0.0)
-assert len(boxes) == S * S * A, len(boxes)
+assert len(boxes) == M, len(boxes)
 best = extract_best_pred_box(det[0].detach())
 assert best.shape == (4,)
 gtb = extract_gt_box(target[0])
 iou = compute_intersection_over_union(best, gtb)
 assert 0.0 <= iou.item() <= 1.0
-print(f"7. decode/extract (A inferred), IoU {iou.item():.3f}  OK")
+print(f"7. decode/extract on [M, 5], IoU {iou.item():.3f}  OK")
 
 # ---- 8. checkpoint round-trip keeps the anchors --------------------------
-ck = {"model_state": model.state_dict(), "anchors": model.anchors_list}
-th.save(ck, "/tmp/ck.pth")
-ck2 = th.load("/tmp/ck.pth", map_location="cpu", weights_only=False)
+ck = {"model_state": model.state_dict(), "anchors": model.anchors_list, "arch": ARCH}
+ck_path = os.path.join(tempfile.gettempdir(), "ck.pth")
+th.save(ck, ck_path)
+ck2 = th.load(ck_path, map_location="cpu", weights_only=False)
 m2 = load_handgesture_net(ck2, in_channels=4, n_classes=10)
 assert m2.anchors_list == model.anchors_list
 m2.eval(); model.eval()
@@ -116,13 +151,14 @@ with th.no_grad():
     assert th.allclose(m2(x)[0], model(x)[0], atol=1e-6)
 print("8. checkpoint round-trip             OK")
 
-# ---- 9. an old (anchor-less) checkpoint must fail LOUDLY -----------------
-try:
-    load_handgesture_net({"model_state": {}}, in_channels=4)
-    raise AssertionError("should have raised")
-except RuntimeError as e:
-    assert "pre-YOLOv2" in str(e)
-print("9. old checkpoint rejected loudly    OK")
+# ---- 9. a checkpoint from another architecture must fail LOUDLY ----------
+for bad in ({"model_state": {}}, {"model_state": {}, "arch": "yolov2"}):
+    try:
+        load_handgesture_net(bad, in_channels=4)
+        raise AssertionError("should have raised")
+    except RuntimeError as e:
+        assert ARCH in str(e)
+print("9. foreign checkpoint rejected loudly OK")
 
 # ---- 10. k-means machinery on synthetic data -----------------------------
 _here = os.path.dirname(os.path.abspath(__file__))

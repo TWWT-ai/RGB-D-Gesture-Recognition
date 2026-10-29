@@ -40,7 +40,7 @@ import PIL.Image as Image
 
 
 IMAGE_SIZE = 448        # must match HandGestureDataset.IMAGE_SIZE
-K_MAX = 8               # how many anchors to try on the sweep
+K_MAX = 12              # how many anchors to try on the sweep  >>> [YOLOv3-CHANGED] was 8, must reach 9
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +387,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-frac", type=float, default=0.1)
     parser.add_argument("--test-frac", type=float, default=0.1)
-    parser.add_argument("--k", type=int, default=5,
-                        help="number of anchors to emit (YOLOv2 used 5)")
+    # >>> [YOLOv3-CHANGED] default 5 -> 9. YOLOv3 uses 9 clusters, 3 per
+    # prediction grid; model.py hands the 3 biggest to 7x7, the next 3 to
+    # 14x14 and the 3 smallest to 28x28 (utils.split_anchors_by_scale).
+    parser.add_argument("--k", type=int, default=9,
+                        help="number of anchors to emit (YOLOv2 used 5, YOLOv3 uses 9)")
     # Relative to the folder you RUN from. Default assumes the project root,
     # which is where you have actually been running it from.
     parser.add_argument("--fig-out", type=str, default="figures/anchor_kmeans.png")
@@ -466,6 +469,15 @@ def main():
         print(f"  ({aw:.4f}, {ah:.4f})      {dw:>8.1%}  {dh:>8.1%}{flag}")
     print("  Wobble = average relative move when the data is resampled.")
     print("  Above ~15% the 'cluster' is mostly these particular boxes talking.")
+
+    # >>> [YOLOv3-NEW] show the per-grid split the model will actually use
+    try:
+        from utils import split_anchors_by_scale, GRIDS
+        print("\nHow model.py will spread them over the prediction grids:")
+        for S_i, group in zip(GRIDS, split_anchors_by_scale(clusters.tolist(), len(GRIDS))):
+            print(f"  {S_i:>2}x{S_i:<2}: {[(round(a, 4), round(b, 4)) for a, b in group]}")
+    except ImportError:      # utils needs torch; the clustering itself does not
+        pass
 
     print("\nPaste into src/utils.py:\n")
     print("ANCHORS = [")

@@ -1,6 +1,18 @@
 import torch as th
 
+# Grid of the dataloader's TARGET container (encode_yolo_target). Since YOLOv3
+# the network predicts on several grids (see GRIDS), but the dataset still
+# stores its one ground-truth box in a 7x7 container; the loss reads the box
+# back out of it and re-assigns it to whichever grid/anchor fits best.
 S = 7
+
+# >>> [YOLOv3-NEW] Prediction grids, coarse -> fine. 448 / 7 = 64 px cells
+# (big hands), 448 / 14 = 32 px, 448 / 28 = 16 px (small / far hands).
+# YOLOv3 predicts at three scales (13, 26, 52 on a 416 input = strides 32, 16, 8).
+# Our backbone already has features at strides 64, 32 and 16 (f7, f14, f28),
+# so we use those: the SegmentationHead reads the same tensors, so no extra
+# backbone stages are needed.
+GRIDS = (7, 14, 28)
 
 # >>> [YOLOv2-NEW] Anchor priors: (width, height) normalised to the image, so
 # they live in exactly the same [0, 1] space as encode_yolo_target's w, h.
@@ -30,6 +42,15 @@ S = 7
 #
 # If you change --k or the split, RE-RUN the script and repaste. The numbers
 # above are the claim; do not let them drift from the list below.
+#
+# >>> [YOLOv3-NOTE] YOLOv3 uses 9 anchors, 3 per scale. These 5 are still the
+# k=5 YOLOv2 clusters, because they are the only ones that were actually
+# measured on the data -- inventing 4 more would be making numbers up.
+# split_anchors_by_scale() spreads whatever list it is given over GRIDS, so
+# 5 anchors run as 2 / 2 / 1 (7x7 / 14x14 / 28x28). For the real YOLOv3
+# setting run:
+#   python src/kmeans_anchors.py --data-root ... --k 9 --out-json anchors9.json
+# and train with --anchors anchors9.json (3 / 3 / 3).
 ANCHORS = [
     (0.0826, 0.1763),
     (0.1429, 0.2388),
@@ -45,6 +66,34 @@ def anchor_tensor(anchors=None, device=None, dtype=th.float32):
     if anchors is None:
         anchors = ANCHORS
     return th.tensor([tuple(a) for a in anchors], dtype=dtype, device=device)
+
+
+# >>> [YOLOv3-NEW]
+def split_anchors_by_scale(anchors, n_scales=len(GRIDS)):
+    """
+    YOLOv3's anchor-to-scale assignment: sort the anchors by AREA, give the
+    largest ones to the coarsest grid and the smallest ones to the finest.
+
+    A 7x7 cell is 64 px wide and sees a big receptive field, so it should
+    predict big boxes; a 28x28 cell is 16 px and should predict small ones.
+    YOLOv3 hard-codes this with its "mask = 6,7,8 / 3,4,5 / 0,1,2" lines;
+    here it is derived from the list so changing --k can never mis-assign.
+
+    Returns a list of n_scales lists of (w, h), coarse grid first (same order
+    as GRIDS). With 9 anchors that is 3 / 3 / 3; with 5 it is 2 / 2 / 1.
+    """
+    anchors = [tuple(float(v) for v in a) for a in anchors]
+    if len(anchors) < n_scales:
+        raise ValueError(f"need at least {n_scales} anchors for {n_scales} scales, "
+                         f"got {len(anchors)}")
+    ordered = sorted(anchors, key=lambda a: a[0] * a[1], reverse=True)
+    base, extra = divmod(len(ordered), n_scales)
+    groups, start = [], 0
+    for i in range(n_scales):
+        n = base + (1 if i < extra else 0)
+        groups.append(ordered[start:start + n])
+        start += n
+    return groups
 
 
 # >>> [YOLOv2-NEW]
@@ -103,24 +152,20 @@ def encode_yolo_target(boundary_box, s=S):
 
 def decode_predictions(prediction, B=None, conf_thresh=0.25, s=S):
     """
-    Inverse of the model output: [S, S, B*5] (one image, after permute)
-    -> list of (x_min, y_min, x_max, y_max, conf), all in [0, 1].
+    Inverse of the model output for ONE image -> list of
+    (x_min, y_min, x_max, y_max, conf), all in [0, 1].
     Used by visualize.py / evaluation, NOT by training.
+
+    >>> [YOLOv3-CHANGED] the model output is now [M, 5]: every box from every
+    grid (7x7, 14x14, 28x28) and every anchor, flattened into one list. The
+    boxes are already decoded by the head, so where a box came from no longer
+    matters here. reshape(-1, 5) also still accepts the old [S, S, B*5] layout,
+    which is why `B` and `s` are kept but ignored.
     """
-    # >>> [YOLOv2-CHANGED] B is now the number of ANCHORS, which changed from 2
-    # to len(ANCHORS). Infer it from the tensor instead of hard-coding it, so
-    # changing the anchor list can never silently mis-reshape the output.
-    if B is None:
-        B = prediction.shape[-1] // 5
-    prediction = prediction.view(s, s, B, 5)
-    boxes = []
-    for row in range(s):
-        for col in range(s):
-            for b in range(B):
-                cx, cy, w, h, conf = prediction[row, col, b].tolist()
-                if conf < conf_thresh:
-                    continue
-                boxes.append((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, conf))
+    prediction = prediction.reshape(-1, 5)
+    keep = prediction[:, 4] >= conf_thresh
+    boxes = [(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, conf)
+             for cx, cy, w, h, conf in prediction[keep].tolist()]
     # Highest confidence first
     boxes.sort(key=lambda box: box[4], reverse=True)
     return boxes
@@ -136,20 +181,14 @@ def extract_gt_box(det_target):
 
 def extract_best_pred_box(det_pred, B=None):
     """
-    From the raw head output of ONE image [S, S, B*5],
-    return the (cx, cy, w, h) of the box with the highest confidence.
-    Center format on purpose, so compute_intersection_over_union can
-    compare it with the ground truth directly.
+    From the head output of ONE image, return the (cx, cy, w, h) of the box
+    with the highest confidence. Center format on purpose, so
+    compute_intersection_over_union can compare it with the ground truth
+    directly.
+
+    >>> [YOLOv3-CHANGED] det_pred is [M, 5] across all three grids now. The
+    argmax runs over every box at every scale, so a big hand found on the 7x7
+    grid and a small one found on the 28x28 grid compete on confidence alone.
     """
-    # >>> [YOLOv2-CHANGED] same reason as decode_predictions: infer the number
-    # of anchors from the tensor rather than assuming 2.
-    if B is None:
-        B = det_pred.shape[-1] // 5
-    det_pred = det_pred.view(S, S, B, 5)
-    conf = det_pred[..., 4]
-    # argmax over the flattened S*S*B boxes, then unravel back to 3 indices
-    flat_idx = conf.flatten().argmax()
-    row = flat_idx // (S * B)
-    col = (flat_idx % (S * B)) // B
-    b = flat_idx % B
-    return det_pred[row, col, b, :4]
+    det_pred = det_pred.reshape(-1, 5)
+    return det_pred[det_pred[:, 4].argmax(), :4]
