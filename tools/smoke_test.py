@@ -1,4 +1,4 @@
-"""CPU smoke test for the YOLOv4 port. Run from src/: python ../tools/smoke_test.py"""
+"""CPU smoke test for the YOLOv5 port. Run from src/: python ../tools/smoke_test.py"""
 import sys, os, math, tempfile
 _here = os.path.dirname(os.path.abspath(__file__))
 for _cand in (os.path.join(_here, "src"), os.path.join(_here, "..", "src")):
@@ -14,9 +14,10 @@ import numpy as np
 from utils import (ANCHORS, GRIDS, anchor_tensor, shape_iou, encode_yolo_target,
                    decode_predictions, extract_best_pred_box, extract_gt_box,
                    compute_intersection_over_union, split_anchors_by_scale, S,
-                   bbox_ciou)
-from model import HandGestureNet, DetectionHead, load_handgesture_net, ARCH, SPP
-from train import yolo_detection_loss, compute_loss, gt_boxes_from_target, assign_targets
+                   bbox_ciou, anchor_fitness, anchor_ratio_metric)
+from model import HandGestureNet, DetectionHead, load_handgesture_net, ARCH, SPPF, C3
+from train import (yolo_detection_loss, compute_loss, gt_boxes_from_target, build_targets,
+                   ModelEMA, param_groups)
 import torch.nn as nn
 
 th.manual_seed(0)
@@ -42,12 +43,14 @@ assert seg.shape == (2, 1, 448, 448), seg.shape
 assert cls.shape == (2, 10), cls.shape
 d = det
 assert th.isfinite(det).all()
-# YOLOv4 grid-sensitivity decode may overshoot the image by (scale_xy-1)/2 cells
-slack = max((DetectionHead.SCALE_XY[g] - 1) / 2 / g for g in GRIDS) + 1e-6
+# YOLOv5 decode: centre in (col - 0.5, col + 1.5) cells, so up to half a cell past the image
+slack = 0.5 / min(GRIDS) + 1e-6
 assert (d[..., 0] >= -slack).all() and (d[..., 0] <= 1 + slack).all(), "cx out of range"
 assert (d[..., 1] >= -slack).all() and (d[..., 1] <= 1 + slack).all(), "cy out of range"
 assert (d[..., 4] >= 0).all() and (d[..., 4] <= 1).all(), "conf out of [0,1]"
 assert (d[..., 2] > 0).all() and (d[..., 3] > 0).all(), "w/h must be positive"
+amax = anchor_tensor(ANCHORS).max(dim=0).values
+assert (d[..., 2] <= 4 * amax[0] + 1e-6).all() and (d[..., 3] <= 4 * amax[1] + 1e-6).all(), "w/h > 4x anchor"
 # objectness prior: everything starts near p = 0.01, not 0.5
 assert d[..., 4].mean() < 0.1, d[..., 4].mean()
 print("1. forward shapes + ranges           OK")
@@ -65,16 +68,16 @@ out = head(feats)
 lay = head.layout()
 for a in range(A):
     Sa = int(lay["grid"][a]); off = int(lay["offset"][a])
-    tol = (DetectionHead.SCALE_XY[Sa] - 1) / 2 / Sa + 1e-4
+    tol = 0.5 / Sa + 1e-4
     cnt = int(lay["count"][a]); loc = int(lay["local"][a])
     for r in range(Sa):
         for c in range(Sa):
             cx, cy = out[0, off + (r * Sa + c) * cnt + loc, :2].tolist()
             assert c / Sa - tol <= cx <= (c + 1) / Sa + tol, (a, r, c, cx)
             assert r / Sa - tol <= cy <= (r + 1) / Sa + tol, (a, r, c, cy)
-            # and with sigmoid -> 1 the stretched decode DOES pass the border
-            assert cx > (c + 1) / Sa, (a, r, c, cx)
-print("2. centre locked to its cell (+ grid-sensitivity slack)  OK")
+            # with sigmoid -> 1 the centre sits at col + 1.5, inside the right neighbour
+            assert abs(cx - (c + 1.5) / Sa) < 1e-4, (a, r, c, cx)
+print("2. centre limited to (col-0.5, col+1.5)  OK")
 
 # ---- 3. anchor assignment is by shape, and is stable ---------------------
 anchors = anchor_tensor(ANCHORS)
@@ -105,7 +108,7 @@ print(f"4. det loss {loss.item():.4f}, grad norm {gnorm:.1f}   OK")
 lay = model.detecting_head.layout()
 fake = th.zeros(1, M, 5); fake[..., 2:4] = 0.1
 gt = th.tensor([0.43, 0.52, 0.2, 0.3])
-box_idx, anc, fi = assign_targets(gt[None], lay)
+box_idx, fi = build_targets(gt[None], lay)
 assert len(fi) >= 1 and len(set(fi.tolist())) == len(fi)
 fake[0, fi, :4] = gt; fake[0, fi, 4] = 1.0
 tgt = th.zeros(1, S, S, 5); tgt[0, 3, 3] = th.tensor([*gt.tolist(), 1.0])
@@ -113,6 +116,12 @@ l_perfect = yolo_detection_loss(fake, tgt, lay).item()
 fake[0, fi[0], 0] += 0.02
 l_off = yolo_detection_loss(fake, tgt, lay).item()
 assert l_perfect < 1e-3 and l_off > l_perfect, (l_perfect, l_off)
+# neighbour cells: centre at (0.2, 0.8) of its cell -> centre + left + down cell
+g2 = th.tensor([[(3 + 0.2) / 14, (5 + 0.8) / 14, 0.15, 0.25]])
+bi, fl = build_targets(g2, lay)
+ratio = anchor_ratio_metric(g2[:, 2:4], lay["anchors"])
+n_match = int(((ratio > 0.25) | (ratio == ratio.max())).sum())
+assert len(fl) == 3 * n_match, (len(fl), n_match)
 print(f"4b. {len(fi)} positives; perfect -> loss {l_perfect:.2e}, nudged -> {l_off:.2e}   OK")
 
 # ---- 4c. CIoU ------------------------------------------------------------
@@ -127,10 +136,34 @@ assert abs(bbox_ciou(b1 * 0.5, th.tensor([0.26, 0.25, 0.1, 0.15])).item() -
            bbox_ciou(b1, th.tensor([0.52, 0.5, 0.2, 0.3])).item()) < 1e-4, "scale-invariant"
 print("4c. CIoU: 1 for identical, <0 and still a gradient when disjoint, scale-invariant  OK")
 
-# ---- 4d. SPP keeps the spatial size and quadruples the channels ----------
-y = SPP()(th.randn(1, 8, 7, 7))
-assert y.shape == (1, 32, 7, 7), y.shape
-print("4d. SPP shape                         OK")
+# ---- 4d. SPPF == SPP(5, 9, 13); C3 keeps the shape ------------------------
+sppf = SPPF(8, 8).eval()
+x7 = th.randn(1, 8, 7, 7)
+with th.no_grad():
+    h = sppf.cv1(x7)
+    spp = th.cat([h] + [th.nn.functional.max_pool2d(h, k, 1, k // 2) for k in (5, 9, 13)], 1)
+    assert th.allclose(sppf.cv2(spp), sppf(x7), atol=1e-6), "SPPF must equal SPP(5,9,13)"
+assert C3(64, 64, n=2)(th.randn(1, 64, 14, 14)).shape == (1, 64, 14, 14)
+print("4d. SPPF == SPP(5,9,13), C3 shape      OK")
+
+# ---- 4e. autoanchor fitness, EMA, param groups ----------------------------
+bpr, aat = anchor_fitness(th.tensor([[0.15, 0.3], [0.9, 0.9], [0.01, 0.01]]), anchor_tensor(ANCHORS))
+assert abs(bpr - 2 / 3) < 1e-6, bpr        # the 0.01 box is > 4x smaller than every anchor
+import copy
+shadow = copy.deepcopy(model)            # do not disturb the shared model, later tests use it
+ema = ModelEMA(shadow)
+w0 = next(ema.ema.parameters()).clone()
+with th.no_grad():
+    for p_ in shadow.parameters():
+        p_.add_(1.0)
+ema.update(shadow)
+w1 = next(ema.ema.parameters())
+assert ema.decay(1) < 0.01 and (w1 - w0).abs().mean() > 0.99, "EMA should follow closely at step 1"
+groups = param_groups(model, 1e-4)
+n_bn = sum(m.weight.numel() for m in model.modules() if isinstance(m, th.nn.BatchNorm2d))
+assert groups[1]["weight_decay"] == 0 and sum(p_.numel() for p_ in groups[1]["params"]) >= n_bn
+assert sum(p_.numel() for g_ in groups for p_ in g_["params"]) == sum(p_.numel() for p_ in model.parameters())
+print(f"4e. autoanchor bpr {bpr:.3f}, EMA ramp, no-decay groups  OK")
 
 # ---- 5. multi-task compute_loss path -------------------------------------
 model.zero_grad()

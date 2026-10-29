@@ -97,6 +97,36 @@ def split_anchors_by_scale(anchors, n_scales=len(GRIDS)):
     return groups
 
 
+# >>> [YOLOv5-NEW]
+def anchor_ratio_metric(boxes_wh, anchors_wh):
+    """
+    YOLOv5's anchor-match metric between (M,2) box (w,h) and (A,2) anchors:
+    for each pair, the WORSE of the width and height ratios, folded into
+    (0, 1] (1 = same size, 0.25 = 4x bigger or smaller on some side).
+
+    YOLOv5 replaced shape-IoU with this for target assignment because it
+    matches what the head can physically do: a box can be predicted from an
+    anchor only if it is within 4x of it on both sides (see the decode,
+    w = anchor_w * (2 * sigmoid)^2 <= 4 * anchor_w).
+    """
+    r = boxes_wh[:, None, :] / anchors_wh[None, :, :]
+    return th.min(r, 1.0 / r).min(dim=2).values
+
+
+# >>> [YOLOv5-NEW]
+def anchor_fitness(boxes_wh, anchors_wh, anchor_t=4.0):
+    """
+    YOLOv5 autoanchor's check. Returns
+      bpr  "best possible recall": fraction of boxes that at least one anchor
+           can predict (ratio within anchor_t)
+      aat  average number of anchors that can predict each box
+    """
+    x = anchor_ratio_metric(boxes_wh, anchors_wh)
+    bpr = (x.max(dim=1).values > 1.0 / anchor_t).float().mean().item()
+    aat = (x > 1.0 / anchor_t).float().sum(dim=1).mean().item()
+    return bpr, aat
+
+
 # >>> [YOLOv2-NEW]
 def shape_iou(boxes_wh, anchors_wh):
     """

@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import argparse
 import os
+import math     # >>> [YOLOv5-NEW]
+import copy     # >>> [YOLOv5-NEW]
 from torch.utils.data import DataLoader
 from pathlib import Path
 import json
@@ -13,6 +15,7 @@ from model import HandGestureNet, ARCH     # >>> [YOLOv3-CHANGED]
 from utils import compute_intersection_over_union
 from utils import shape_iou, anchor_tensor, ANCHORS     # >>> [YOLOv2-NEW]
 from utils import bbox_ciou     # >>> [YOLOv4-NEW]
+from utils import anchor_ratio_metric, anchor_fitness     # >>> [YOLOv5-NEW]
 # Grid size
 S = 7
 
@@ -39,92 +42,115 @@ def _bce(p, y, eps=1e-7):
     return -(y * th.log(p + eps) + (1 - y) * th.log(1 - p + eps))
 
 
-def assign_targets(gt, layout, iou_thresh=0.213):
+def build_targets(gt, layout, anchor_t=4.0):
     """
-    >>> [YOLOv4-NEW] Which (image, anchor, cell) predictions are POSITIVES?
+    >>> [YOLOv5-CHANGED] replaces YOLOv4's assign_targets. Which
+    (image, anchor, cell) predictions are POSITIVES?
 
-    YOLOv3: exactly one -- the anchor with the best shape-IoU.
-    YOLOv4: the best one AND every other anchor whose shape-IoU with the
-    ground truth is above `iou_thresh` (YOLOv4's cfg value is 0.213), each
-    in the cell of ITS OWN grid that holds the centre. A hand that sits
-    between two anchor sizes now trains both instead of only one, which gives
-    more positive samples per image -- useful when only ~900 frames have boxes.
+    1. Anchor match by SIZE RATIO, not shape-IoU: an anchor is used if the box
+       is within anchor_t (4x) of it in both width and height
+       (utils.anchor_ratio_metric). This is exactly the range the new decode
+       can reach, so no anchor is ever asked for a box it cannot produce.
+       (YOLOv5 drops a box that no anchor matches; with ONE hand per image
+       that would lose the whole frame, so the closest anchor is always kept.)
+    2. Neighbouring cells: besides the cell that holds the centre, the TWO
+       nearest neighbouring cells (one horizontal, one vertical -- the side
+       of the cell the centre is closer to) are positives too. The new decode
+       lets a cell reach centres in (col - 0.5, col + 1.5), so they can.
+       That is up to 3x more positives per anchor, which is the main reason
+       YOLOv5 converges faster.
 
-    gt: [n, 4] (cx, cy, w, h). Returns (box_idx, anchor, flat) for every positive,
-    where box_idx indexes into gt and flat into the [M] predictions of that image.
+    gt: [n, 4] (cx, cy, w, h). Returns (box_idx, flat) per positive.
     """
     anchors = layout["anchors"].to(gt.dtype)
-    siou = shape_iou(gt[:, 2:4], anchors)                       # [n, A]
-    pos = siou > iou_thresh
-    pos[th.arange(gt.size(0), device=gt.device), siou.argmax(dim=1)] = True
-    box_idx, anchor = th.nonzero(pos, as_tuple=True)
+    ratio = anchor_ratio_metric(gt[:, 2:4], anchors)              # [n, A]
+    match = ratio > 1.0 / anchor_t
+    match[th.arange(gt.size(0), device=gt.device), ratio.argmax(dim=1)] = True
+    box_idx, anchor = th.nonzero(match, as_tuple=True)
     g = gt[box_idx]
     S_a = layout["grid"][anchor]
-    # Which cell of THAT grid holds the centre? min() guards cx == 1.0.
-    col = th.minimum((g[:, 0] * S_a).long(), S_a - 1)
-    row = th.minimum((g[:, 1] * S_a).long(), S_a - 1)
-    flat = layout["offset"][anchor] + (row * S_a + col) * layout["count"][anchor] + layout["local"][anchor]
-    return box_idx, anchor, flat
+    Sf = S_a.to(gt.dtype)
+
+    gxy = g[:, :2] * Sf[:, None]                  # centre in grid units
+    gxi = Sf[:, None] - gxy                       # same, measured from the far side
+    left_up = (gxy % 1 < 0.5) & (gxy > 1)         # closer to the left / top border
+    right_down = (gxi % 1 < 0.5) & (gxi > 1)      # closer to the right / bottom border
+    #           centre,  left,          up,            right,           down
+    use = th.stack([th.ones_like(left_up[:, 0]), left_up[:, 0], left_up[:, 1],
+                    right_down[:, 0], right_down[:, 1]])           # [5, n]
+    off = th.tensor([[0, 0], [-1, 0], [0, -1], [1, 0], [0, 1]], device=gt.device)
+
+    k, j = th.nonzero(use, as_tuple=True)        # (which offset, which match)
+    col = th.minimum(gxy[j, 0].long(), S_a[j] - 1) + off[k, 0]
+    row = th.minimum(gxy[j, 1].long(), S_a[j] - 1) + off[k, 1]
+    col = th.maximum(th.minimum(col, S_a[j] - 1), th.zeros_like(col))
+    row = th.maximum(th.minimum(row, S_a[j] - 1), th.zeros_like(row))
+    a = anchor[j]
+    flat = layout["offset"][a] + (row * S_a[j] + col) * layout["count"][a] + layout["local"][a]
+    return box_idx[j], flat
 
 
-def yolo_detection_loss(prediction, target, layout, lambda_box=1.0, lambda_obj=1.0,
-                        lambda_noobj=1.0, ignore_thresh=0.7, iou_thresh=0.213):
+# >>> [YOLOv5-NEW] YOLOv5's hyper-parameters (hyp.scratch-low.yaml), already
+# rescaled the way train.py in YOLOv5 rescales them: box *= 3 / n_layers,
+# obj *= (img_size / 640)^2 * 3 / n_layers  ->  3 layers, 448 px.
+BOX_GAIN = 0.05
+OBJ_GAIN = 1.0 * (448 / 640) ** 2
+# Objectness weight per grid: YOLOv5's [4.0, 1.0, 0.4] for P3 / P4 / P5. The
+# finest grid has 16x more cells than the coarsest, so its MEAN objectness
+# loss is much smaller per cell; the balance gives each scale a fair say.
+OBJ_BALANCE = {28: 4.0, 14: 1.0, 7: 0.4}
+# YOLOv5 multiplies its loss by the batch size. Here that would put train
+# (~3 annotated frames per batch) and val (16 per batch) on different scales,
+# so the default batch size is used as a fixed constant instead.
+LOSS_SCALE = 16.0
+
+
+def yolo_detection_loss(prediction, target, layout, anchor_t=4.0,
+                        box_gain=BOX_GAIN, obj_gain=OBJ_GAIN, loss_scale=LOSS_SCALE):
     """
-    >>> [YOLOv4-CHANGED] (on top of the YOLOv3 version)
+    >>> [YOLOv5-CHANGED] (on top of the YOLOv4 version)
 
         Steps:
         1. Read the one ground-truth box per image out of the target ->
-        2. assign_targets(): best anchor + every anchor above iou_thresh,
-           each on its own grid ->
-        3. Box term = 1 - CIoU on every positive ->
-        4. Objectness BCE on every prediction (1 for positives, 0 for the
-           rest, ignored if IoU > ignore_thresh) ->
-        5. Weighted sum
+        2. build_targets(): ratio-matched anchors x (centre + 2 neighbour cells) ->
+        3. Box term = mean(1 - CIoU) over the positives ->
+        4. Objectness: BCE per grid against an IoU-AWARE target, averaged per
+           grid and weighted by OBJ_BALANCE ->
+        5. box_gain * box + obj_gain * obj
 
-    What changed from YOLOv3:
-    - Box loss: MSE on (offset, log w/h) -> 1 - CIoU (see utils.bbox_ciou).
-      CIoU is already scale-invariant, so YOLOv3's (2 - w*h) weight is gone.
-    - Several positives per hand (iou_thresh), not one.
-    - ignore_thresh 0.5 -> 0.7, YOLOv4's cfg value. With more positives the
-      model produces more decent boxes, and only really good non-positive
-      ones should escape the background penalty.
-    Kept from YOLOv3: BCE objectness, lambdas of 1.
+    What changed from YOLOv4:
+    - Positives: ratio match + neighbour cells (see build_targets).
+    - Objectness target for a positive is its own CIoU with the truth
+      (clamped at 0), not 1. A badly placed positive box is no longer
+      trained to be confident, so confidence ranks boxes by how good they
+      are -- which is exactly what extract_best_pred_box relies on.
+    - No ignore threshold: with an IoU-valued target it is not needed.
+    - Losses are MEANS (box over positives, objectness over every cell of a
+      grid) with YOLOv5's gains, instead of per-image sums.
     """
     N, M, _ = prediction.shape
     gt = gt_boxes_from_target(target)                     # [N, 5]
     has_box = gt[:, 4] > 0.5
     conf = prediction[..., 4]                             # [N, M]
-
-    # ---- objectness targets: 0 everywhere to start with ----
     obj_target = th.zeros_like(conf)
-    obj_weight = th.full_like(conf, lambda_noobj)
 
-    if has_box.sum() == 0:
-        # Safety check
-        return (obj_weight * _bce(conf, obj_target)).sum() / N
+    loss_box = prediction.new_zeros(())
+    if has_box.any():
+        idx = th.nonzero(has_box).squeeze(1)
+        box_idx, flat = build_targets(gt[idx, :4], layout, anchor_t)
+        img = idx[box_idx]
+        response = prediction[img, flat]                  # [n_pos, 5]
+        ciou = bbox_ciou(response[:, :4], gt[img, :4])
+        loss_box = (1.0 - ciou).mean()
+        obj_target[img, flat] = ciou.detach().clamp(min=0).to(obj_target.dtype)
 
-    # Ignore mask: predicted boxes already overlapping the truth well enough.
-    with th.no_grad():
-        iou_all = compute_intersection_over_union(prediction[..., :4], gt[:, None, :4])
-        ignore = (iou_all > ignore_thresh) & has_box[:, None]
-    obj_weight = obj_weight.masked_fill(ignore, 0.0)
-
-    # ---- step 2: positives ----
-    idx = th.nonzero(has_box).squeeze(1)
-    box_idx, _, flat = assign_targets(gt[idx, :4], layout, iou_thresh)
-    img = idx[box_idx]
-
-    obj_target[img, flat] = 1.0
-    obj_weight[img, flat] = lambda_obj
-    loss_obj = (obj_weight * _bce(conf, obj_target)).sum()
-
-    # ---- step 3: CIoU on every positive ----
-    response = prediction[img, flat]                      # [n_pos, 5]
-    ciou = bbox_ciou(response[:, :4], gt[img, :4])
-    loss_box = (1.0 - ciou).sum()
+    loss_obj = prediction.new_zeros(())
+    for S_i, start, end in layout["scales"]:
+        loss_obj = loss_obj + OBJ_BALANCE.get(S_i, 1.0) * _bce(conf[:, start:end],
+                                                                obj_target[:, start:end]).mean()
 
     # Returning Multi Part loss function
-    return (lambda_box * loss_box + loss_obj) / N
+    return (box_gain * loss_box + obj_gain * loss_obj) * loss_scale
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0,
@@ -163,6 +189,87 @@ def compute_loss(outputs, targets, segmentation_criterion, classification_criter
 
 
 #---------------------------------------------------
+# >>> [YOLOv5-NEW] Training machinery from YOLOv5
+#---------------------------------------------------
+
+class ModelEMA:
+    """
+    Exponential moving average of the weights (YOLOv5's ModelEMA).
+
+    After every optimizer step:  ema = d * ema + (1 - d) * weights,
+    with d ramping up as 0.9999 * (1 - exp(-updates / 2000)) so the average
+    does not drag in the random initial weights. Validation, checkpointing and
+    therefore evaluate.py all use the EMA copy: it is a free ensemble of the
+    last few thousand steps and noticeably less noisy from epoch to epoch,
+    which also makes the best.pth guardrail below more trustworthy.
+    BatchNorm running statistics are averaged the same way.
+    """
+    def __init__(self, model, decay=0.9999, tau=2000):
+        self.ema = copy.deepcopy(model).eval()
+        self.updates = 0
+        self.decay = lambda x: decay * (1 - math.exp(-x / tau))
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @th.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = self.decay(self.updates)
+        msd = model.state_dict()
+        for k, v in self.ema.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(d).add_(msd[k].detach(), alpha=1 - d)
+
+
+def param_groups(model, weight_decay):
+    """
+    YOLOv5's three parameter groups: weight decay ONLY on conv / linear
+    weights. Decaying BatchNorm scales and biases just pulls them towards 0,
+    which fights the normalisation instead of regularising anything.
+    """
+    decay, no_decay = [], []
+    for module in model.modules():
+        for name, p in module.named_parameters(recurse=False):
+            if not p.requires_grad:
+                continue
+            if name == "weight" and not isinstance(module, nn.modules.batchnorm._BatchNorm):
+                decay.append(p)
+            else:
+                no_decay.append(p)
+    return [{"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0}]
+
+
+def check_anchors(data_root, train_persons, anchors, anchor_t=4.0, thr=0.98):
+    """
+    YOLOv5's autoanchor, run once before training: measure how well the
+    anchors cover the TRAINING boxes; if fewer than 98% of boxes can be
+    reached by some anchor (bpr), re-fit k anchors with IoU k-means and keep
+    them only if they are better. The chosen anchors are saved in the
+    checkpoint like before, so evaluation always uses the same ones.
+    """
+    from kmeans_anchors import collect_wh, best_of_n_restarts
+    import numpy as np
+    wh = collect_wh(data_root, set(train_persons))
+    boxes = th.tensor(wh, dtype=th.float32)
+    bpr, aat = anchor_fitness(boxes, anchor_tensor(anchors), anchor_t)
+    print(f"AutoAnchor: {aat:.2f} anchors/target, best possible recall {bpr:.4f}")
+    if bpr >= thr:
+        print("AutoAnchor: current anchors fit the data, keeping them")
+        return anchors
+    new, _ = best_of_n_restarts(np.asarray(wh), len(anchors))
+    new = [(round(float(w), 4), round(float(h), 4)) for w, h in new]
+    new_bpr, new_aat = anchor_fitness(boxes, anchor_tensor(new), anchor_t)
+    print(f"AutoAnchor: re-fitted {len(new)} anchors -> {new_aat:.2f} anchors/target, "
+          f"best possible recall {new_bpr:.4f}")
+    if new_bpr > bpr:
+        print(f"AutoAnchor: using the new anchors {new}")
+        return new
+    print("AutoAnchor: re-fit was not better, keeping the original anchors")
+    return anchors
+
+
+#---------------------------------------------------
 # Train and validation
 #---------------------------------------------------
 
@@ -184,7 +291,8 @@ def _forward_fp32(model, images, use_amp):
 def train_one_epoch(model, loader, optimizer, segmentation_criterion,
                     classification_criterion, device, lambda_segmentation,
                     lambda_classification, lambda_detection=1.0,
-                    scaler=None, use_amp=False):
+                    scaler=None, use_amp=False,
+                    ema=None, warmup=None):     # >>> [YOLOv5-NEW]
     model.train()
     # >>> [YOLOv2-NEW] read the anchors off the model, so the loss can never
     # be matched against a different anchor set from the one the head decoded with
@@ -201,7 +309,10 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
     correct = zero.clone()                 # track TRAIN classification accuracy
     total_samples = 0
 
-    for images, targets in loader:
+    for i, (images, targets) in enumerate(loader):
+        # >>> [YOLOv5-NEW] per-iteration learning-rate warmup (no-op once over)
+        if warmup is not None:
+            warmup(i)
         # Copying what is on CPU onto GPU (RAM to VRAM). non_blocking pairs with
         # the loader's pin_memory=True so the copy overlaps with compute.
         images = images.to(device, non_blocking=True)
@@ -228,6 +339,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
             loss.backward()
             # Using Adam formula to update the and override the old data
             optimizer.step()
+        if ema is not None:
+            ema.update(model)     # >>> [YOLOv5-NEW]
 
         # Adding the loss to the training model
         for k in running:
@@ -326,6 +439,15 @@ def main():
     # one class (hand), so it goes on the gesture ClassificationHead instead.
     # --label-smoothing 0 gives back the exact YOLOv3-branch behaviour.
     parser.add_argument("--label-smoothing", type=float, default=0.1)
+    # >>> [YOLOv5-NEW] YOLOv5 training defaults
+    parser.add_argument("--warmup-epochs", type=float, default=3.0,
+                        help="linear LR warmup length (YOLOv5 default 3); 0 disables")
+    parser.add_argument("--lrf", type=float, default=0.01,
+                        help="final LR = lr * lrf at the end of the cosine schedule")
+    parser.add_argument("--ema", dest="ema", action="store_true", default=True)
+    parser.add_argument("--no-ema", dest="ema", action="store_false")
+    parser.add_argument("--autoanchor", dest="autoanchor", action="store_true", default=True)
+    parser.add_argument("--no-autoanchor", dest="autoanchor", action="store_false")
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
     # >>> [YOLOv2-NEW] anchors from a file beat anchors hand-pasted into utils.py:
@@ -384,6 +506,12 @@ def main():
         cache_dir=args.cache_dir or None,
     )
     
+    # >>> [YOLOv5-NEW] autoanchor on the TRAIN persons only (same leakage rule
+    # as kmeans_anchors.py)
+    if args.autoanchor:
+        train_persons = {s["Person"] for s in train_loader.dataset.samples}
+        anchors = check_anchors(args.data_root, train_persons, anchors)
+
     #Creating model, optimizer, loss
     model = HandGestureNet(in_channels=4, n_classes=10, anchors=anchors).to(device)
     print(f"Detection head: {len(anchors)} anchors (w, h, normalised) = "
@@ -393,8 +521,20 @@ def main():
         print(f"  {S_i:>2}x{S_i:<2} grid: {[(round(a, 3), round(b, 3)) for a, b in group]}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)     # >>> [YOLOv4-CHANGED]
-    optimizer = th.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = th.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # >>> [YOLOv5-CHANGED] weight decay only on conv/linear weights (param_groups)
+    optimizer = th.optim.Adam(param_groups(model, args.weight_decay), lr=args.lr)
+    # >>> [YOLOv5-CHANGED] YOLOv5's cosine "one-cycle" factor, lr -> lr * lrf.
+    # LambdaLR rather than CosineAnnealingLR because LambdaLR recomputes the
+    # LR from scratch every epoch, so the per-iteration warmup below can
+    # overwrite it without corrupting the schedule.
+    lf = lambda e: ((1 - math.cos(e * math.pi / args.epochs)) / 2) * (args.lrf - 1) + 1
+    scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    ema = ModelEMA(model) if args.ema else None
+    # YOLOv5 warms up for max(3 epochs, 100 iterations), ramping the LR
+    # linearly from 0. Adam's first steps on a from-scratch network are the
+    # largest it will ever take, and a bad first few hundred steps can push
+    # BatchNorm statistics somewhere the rest of training has to undo.
+    n_warmup = max(round(args.warmup_epochs * len(train_loader)), 100) if args.warmup_epochs > 0 else 0
     
     # Creating location to store the outputs
     output_directory = Path(args.out_dir)
@@ -406,10 +546,20 @@ def main():
     
     # Training loop
     for epoch in range(1, args.epochs + 1):
+        # >>> [YOLOv5-NEW]
+        def warmup(i, epoch=epoch):
+            ni = i + (epoch - 1) * len(train_loader)
+            if ni < n_warmup:
+                for g in optimizer.param_groups:
+                    g["lr"] = g["initial_lr"] * lf(epoch - 1) * ni / n_warmup
+
         train_m = train_one_epoch(model, train_loader, optimizer, segmentation_criterion,
                                   classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det,
-                                  scaler=scaler, use_amp=use_amp)
-        val_m = validate(model, validation_loader, segmentation_criterion,
+                                  scaler=scaler, use_amp=use_amp,
+                                  ema=ema, warmup=warmup if n_warmup else None)     # >>> [YOLOv5-CHANGED]
+        # >>> [YOLOv5-CHANGED] validate + checkpoint the EMA weights
+        eval_model = ema.ema if ema is not None else model
+        val_m = validate(eval_model, validation_loader, segmentation_criterion,
                                   classification_criterion, device, args.lambda_seg, args.lambda_cls, args.lambda_det,
                                   use_amp=use_amp)
         scheduler.step()
@@ -441,7 +591,7 @@ def main():
             best_val_acc = val_m["cls_acc"]
             th.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": eval_model.state_dict(),     # >>> [YOLOv5-CHANGED] EMA weights
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss": val_m["total"],
                 "val_cls_acc": best_val_acc,
@@ -461,7 +611,7 @@ def main():
                   f"{'seg' if not seg_ok else 'det'} regressed beyond tolerance, NOT saved")
 
     # Save the best model/value overall
-    th.save({"epoch": args.epochs, "model_state": model.state_dict(),
+    th.save({"epoch": args.epochs, "model_state": eval_model.state_dict(),     # >>> [YOLOv5-CHANGED]
              "arch": ARCH,     # >>> [YOLOv3-NEW]
              "anchors": model.anchors_list},     # >>> [YOLOv2-NEW]
                output_directory / "last.pth")
