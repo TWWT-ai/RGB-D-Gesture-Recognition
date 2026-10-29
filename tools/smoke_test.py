@@ -147,7 +147,7 @@ assert C3(64, 64, n=2)(th.randn(1, 64, 14, 14)).shape == (1, 64, 14, 14)
 print("4d. SPPF == SPP(5,9,13), C3 shape      OK")
 
 # ---- 4e. autoanchor fitness, EMA, param groups ----------------------------
-bpr, aat = anchor_fitness(th.tensor([[0.15, 0.3], [0.9, 0.9], [0.01, 0.01]]), anchor_tensor(ANCHORS))
+bpr, aat = anchor_fitness(th.tensor([[0.15, 0.3], [0.6, 0.8], [0.01, 0.01]]), anchor_tensor(ANCHORS))
 assert abs(bpr - 2 / 3) < 1e-6, bpr        # the 0.01 box is > 4x smaller than every anchor
 import copy
 shadow = copy.deepcopy(model)            # do not disturb the shared model, later tests use it
