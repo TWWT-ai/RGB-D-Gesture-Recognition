@@ -301,12 +301,17 @@ class DetectionHead(nn.Module):
         sxy = self.SCALE_XY.get(S, 1.0)     # >>> [YOLOv4-CHANGED]
         cx = (sxy * th.sigmoid(t[..., 0]) - (sxy - 1) / 2 + cols) / S
         cy = (sxy * th.sigmoid(t[..., 1]) - (sxy - 1) / 2 + rows) / S
-        # clamp before exp: an untrained network can emit large values and
+        # bound tw before exp: an untrained network can emit large values and
         # exp() would overflow to inf, which poisons the whole loss.
+        # >>> [YOLOv3-CHANGED] was a hard clamp(-4, 4). A hard clamp has ZERO
+        # gradient outside its range, so once tw overshot -4 the box was stuck
+        # at anchor * e^-4 for the rest of training (seen in an overfit test).
+        # 4 * tanh(tw / 4) has the same +-4 bound, is ~identity near 0, and its
+        # gradient never vanishes, so an overshoot can always be pulled back.
         aw = anchors[:, 0].view(1, 1, 1, A).to(t.dtype)
         ah = anchors[:, 1].view(1, 1, 1, A).to(t.dtype)
-        w = aw * th.exp(t[..., 2].clamp(-4.0, 4.0))
-        h = ah * th.exp(t[..., 3].clamp(-4.0, 4.0))
+        w = aw * th.exp(4.0 * th.tanh(t[..., 2] / 4.0))
+        h = ah * th.exp(4.0 * th.tanh(t[..., 3] / 4.0))
         conf = th.sigmoid(t[..., 4])
         return th.stack([cx, cy, w, h, conf], dim=-1)
 
