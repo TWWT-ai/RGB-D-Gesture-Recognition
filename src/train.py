@@ -111,7 +111,7 @@ def yolo_detection_loss(prediction, target, layout, lambda_coord=1.0, lambda_obj
     loss_xy = (scale[:, None] * (pred_off - gt_off) ** 2).sum()
 
     # Size in LOG space relative to the anchor, i.e. on tw / th directly, as
-    # YOLOv3 does. log(w / anchor_w) is exactly the (clamped) tw the head used.
+    # YOLOv3 does. log(w / anchor_w) is exactly the (tanh-bounded) tw the head used.
     aw = anchors[best]
     pred_twh = th.log(response[:, 2:4].clamp(min=1e-6) / aw)
     gt_twh = th.log(g[:, 2:4].clamp(min=1e-6) / aw)
