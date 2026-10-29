@@ -207,9 +207,10 @@ class DetectionHead(nn.Module):
     #   centred in the NEIGHBOURING cell, which the loss now uses to give
     #   every hand three positive cells instead of one (see build_targets).
     # - exp(tw) is gone. exp is unbounded, which is why every earlier branch
-    #   had to clamp tw to [-4, 4]; (2 * sigmoid)^2 is bounded by construction
-    #   at 4x the anchor -- matching the anchor_t = 4 rule the loss uses to
-    #   decide which anchors may predict a box at all.
+    #   had to bound tw to +-4 (hard clamp on v2, 4 * tanh(tw / 4) since v3);
+    #   (2 * sigmoid)^2 is bounded by construction at 4x the anchor --
+    #   matching the anchor_t = 4 rule the loss uses to decide which anchors
+    #   may predict a box at all.
     def __init__(self, B=2, anchors=None, in_channels=(1024, 512, 256), grids=GRIDS):
         super().__init__()
         # `B` is kept only so old call sites do not crash; the real count is
