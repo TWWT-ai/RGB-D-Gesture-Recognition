@@ -1,6 +1,12 @@
 """
 YOLOv2-style dimension clusters (anchor priors) for HandGestureNet.
 
+>>> [YOLOv10-NOTE] NOT USED for training on the yolov10 branch: the YOLOv10
+detector is anchor-free, so there are no priors to fit. The script is kept
+because its box statistics (width / height / aspect ratio of the training
+hands) are still a useful description of the data. The anchors themselves
+are used on the yolov2 .. yolov5 branches.
+
 WHY THIS EXISTS
 ---------------
 The current DetectionHead is YOLOv1-style: every cell regresses B free boxes
@@ -469,15 +475,6 @@ def main():
         print(f"  ({aw:.4f}, {ah:.4f})      {dw:>8.1%}  {dh:>8.1%}{flag}")
     print("  Wobble = average relative move when the data is resampled.")
     print("  Above ~15% the 'cluster' is mostly these particular boxes talking.")
-
-    # >>> [YOLOv3-NEW] show the per-grid split the model will actually use
-    try:
-        from utils import split_anchors_by_scale, GRIDS
-        print("\nHow model.py will spread them over the prediction grids:")
-        for S_i, group in zip(GRIDS, split_anchors_by_scale(clusters.tolist(), len(GRIDS))):
-            print(f"  {S_i:>2}x{S_i:<2}: {[(round(a, 4), round(b, 4)) for a, b in group]}")
-    except ImportError:      # utils needs torch; the clustering itself does not
-        pass
 
     print("\nPaste into src/utils.py:\n")
     print("ANCHORS = [")

@@ -149,13 +149,12 @@ def main():
         )
  
     # Rebuild the empty model, then pour the trained weights back in
-    # >>> [YOLOv2-CHANGED] the anchor set now comes out of the checkpoint instead
-    # of a hard-coded B=2, so evaluation can never use different priors from training
+    # >>> [YOLOv10-CHANGED] anchor-free: nothing to read back except the arch,
+    # which load_handgesture_net checks so a checkpoint from another branch fails loudly
     checkpoint = th.load(args.weights, map_location=device)
     model = load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=device)
     print(f"Loaded {args.weights} (epoch {checkpoint.get('epoch', '?')}, "
           f"val_loss {checkpoint.get('val_loss', float('nan')):.4f})")
-    print(f"Anchors: {[(round(a, 3), round(b, 3)) for a, b in model.anchors_list]}")   # >>> [YOLOv2-NEW]
  
     metrics = evaluate(model, test_loader, device, iou_thresh=args.iou_thresh)
     print_report(metrics, iou_thresh=args.iou_thresh)

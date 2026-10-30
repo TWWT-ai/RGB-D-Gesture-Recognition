@@ -13,9 +13,9 @@ from dataloader import get_dataLoaders
 from dataloader import HandGestureDataset
 from model import HandGestureNet, ARCH     # >>> [YOLOv3-CHANGED]
 from utils import compute_intersection_over_union
-from utils import shape_iou, anchor_tensor, ANCHORS     # >>> [YOLOv2-NEW]
 from utils import bbox_ciou     # >>> [YOLOv4-NEW]
-from utils import anchor_ratio_metric, anchor_fitness     # >>> [YOLOv5-NEW]
+# >>> [YOLOv10-CHANGED] the anchor helpers (shape_iou, anchor_tensor, ANCHORS,
+# anchor_ratio_metric, anchor_fitness) are gone: the detector is anchor-free.
 # Grid size
 S = 7
 
@@ -34,127 +34,147 @@ def gt_boxes_from_target(target):
     return flat[th.arange(flat.size(0), device=flat.device), idx]
 
 
-def _bce(p, y, eps=1e-7):
-    # BCE on a probability. The head hands out sigmoid(t), not t, so this is
-    # written out by hand with an eps instead of clamping p: a clamp would zero
-    # the gradient of a positive that is stuck near p = 0, which is exactly the
-    # case that most needs one.
-    return -(y * th.log(p + eps) + (1 - y) * th.log(1 - p + eps))
+# >>> [YOLOv10-NEW] YOLOv8 / YOLOv10 loss hyper-parameters (default.yaml)
+BOX_GAIN = 7.5
+CLS_GAIN = 0.5
+DFL_GAIN = 1.5
+# Task-aligned matching metric  t = score^ALPHA * IoU^BETA. YOLOv10's
+# "consistent matching metric" means BOTH heads use these same two numbers;
+# only how many points each may take differs.
+TAL_ALPHA = 0.5
+TAL_BETA = 6.0
+TOPK_O2M = 10     # one-to-many head: 10 positives per hand
+TOPK_O2O = 1      # one-to-one head: exactly 1 positive per hand -> no NMS
 
 
-def build_targets(gt, layout, anchor_t=4.0):
+@th.no_grad()
+def task_aligned_assign(pred_boxes, scores, gt, has_box, points, topk, eps=1e-9):
     """
-    >>> [YOLOv5-CHANGED] replaces YOLOv4's assign_targets. Which
-    (image, anchor, cell) predictions are POSITIVES?
+    >>> [YOLOv10-NEW] Task-Aligned Assigner (TOOD, used by YOLOv8 / YOLOv10).
 
-    1. Anchor match by SIZE RATIO, not shape-IoU: an anchor is used if the box
-       is within anchor_t (4x) of it in both width and height
-       (utils.anchor_ratio_metric). This is exactly the range the new decode
-       can reach, so no anchor is ever asked for a box it cannot produce.
-       (YOLOv5 drops a box that no anchor matches; with ONE hand per image
-       that would lose the whole frame, so the closest anchor is always kept.)
-    2. Neighbouring cells: besides the cell that holds the centre, the TWO
-       nearest neighbouring cells (one horizontal, one vertical -- the side
-       of the cell the centre is closer to) are positives too. The new decode
-       lets a cell reach centres in (col - 0.5, col + 1.5), so they can.
-       That is up to 3x more positives per anchor, which is the main reason
-       YOLOv5 converges faster.
+    Earlier branches decided the positives from the ground truth alone (which
+    anchor has the right shape, which cell holds the centre). TAL asks the
+    network: among the points that lie INSIDE the hand's box, which ones
+    already predict it best, measured by
+        t = score^0.5 * CIoU(pred, gt)^6
+    -- a point needs BOTH a confident score AND a well-placed box. The top-k
+    by t become positives, so supervision follows the points that are
+    actually learning the hand, instead of a fixed geometric rule.
 
-    gt: [n, 4] (cx, cy, w, h). Returns (box_idx, flat) per positive.
+    The score target is t rescaled so the best positive's target equals its
+    IoU: the score learns "how good is my box", like YOLOv5's IoU-valued
+    objectness, which is what extract_best_pred_box relies on.
+
+    pred_boxes [N, M, 4] (cx, cy, w, h), scores [N, M] in [0, 1],
+    gt [N, 5] (cx, cy, w, h, has_box), points [M, 2].
+    Returns target_scores [N, M] (0 = negative) and the positive mask [N, M].
     """
-    anchors = layout["anchors"].to(gt.dtype)
-    ratio = anchor_ratio_metric(gt[:, 2:4], anchors)              # [n, A]
-    match = ratio > 1.0 / anchor_t
-    match[th.arange(gt.size(0), device=gt.device), ratio.argmax(dim=1)] = True
-    box_idx, anchor = th.nonzero(match, as_tuple=True)
-    g = gt[box_idx]
-    S_a = layout["grid"][anchor]
-    Sf = S_a.to(gt.dtype)
+    x1, y1 = gt[:, 0] - gt[:, 2] / 2, gt[:, 1] - gt[:, 3] / 2
+    x2, y2 = gt[:, 0] + gt[:, 2] / 2, gt[:, 1] + gt[:, 3] / 2
+    px, py = points[None, :, 0], points[None, :, 1]
+    inside = ((px > x1[:, None] + eps) & (px < x2[:, None] - eps) &
+              (py > y1[:, None] + eps) & (py < y2[:, None] - eps) & has_box[:, None])
 
-    gxy = g[:, :2] * Sf[:, None]                  # centre in grid units
-    gxi = Sf[:, None] - gxy                       # same, measured from the far side
-    left_up = (gxy % 1 < 0.5) & (gxy > 1)         # closer to the left / top border
-    right_down = (gxi % 1 < 0.5) & (gxi > 1)      # closer to the right / bottom border
-    #           centre,  left,          up,            right,           down
-    use = th.stack([th.ones_like(left_up[:, 0]), left_up[:, 0], left_up[:, 1],
-                    right_down[:, 0], right_down[:, 1]])           # [5, n]
-    off = th.tensor([[0, 0], [-1, 0], [0, -1], [1, 0], [0, 1]], device=gt.device)
+    iou = bbox_ciou(pred_boxes, gt[:, None, :4]).clamp(min=0) * inside
+    align = scores.pow(TAL_ALPHA) * iou.pow(TAL_BETA) * inside
+    # tiny bonus for being inside, so points inside the box always outrank
+    # points outside it even when every t is still ~0 early in training
+    _, top = (align + inside * 1e-12).topk(min(topk, align.size(1)), dim=1)
+    pos = th.zeros_like(inside).scatter_(1, top, True) & inside
 
-    k, j = th.nonzero(use, as_tuple=True)        # (which offset, which match)
-    col = th.minimum(gxy[j, 0].long(), S_a[j] - 1) + off[k, 0]
-    row = th.minimum(gxy[j, 1].long(), S_a[j] - 1) + off[k, 1]
-    col = th.maximum(th.minimum(col, S_a[j] - 1), th.zeros_like(col))
-    row = th.maximum(th.minimum(row, S_a[j] - 1), th.zeros_like(row))
-    a = anchor[j]
-    flat = layout["offset"][a] + (row * S_a[j] + col) * layout["count"][a] + layout["local"][a]
-    return box_idx[j], flat
+    align = align * pos
+    norm = (iou * pos).amax(dim=1, keepdim=True) / (align.amax(dim=1, keepdim=True) + eps)
+    return align * norm, pos
 
 
-# >>> [YOLOv5-NEW] YOLOv5's hyper-parameters (hyp.scratch-low.yaml), already
-# rescaled the way train.py in YOLOv5 rescales them: box *= 3 / n_layers,
-# obj *= (img_size / 640)^2 * 3 / n_layers  ->  3 layers, 448 px.
-BOX_GAIN = 0.05
-OBJ_GAIN = 1.0 * (448 / 640) ** 2
-# Objectness weight per grid: YOLOv5's [4.0, 1.0, 0.4] for P3 / P4 / P5. The
-# finest grid has 16x more cells than the coarsest, so its MEAN objectness
-# loss is much smaller per cell; the balance gives each scale a fair say.
-OBJ_BALANCE = {28: 4.0, 14: 1.0, 7: 0.4}
-# YOLOv5 multiplies its loss by the batch size. Here that would put train
-# (~3 annotated frames per batch) and val (16 per batch) on different scales,
-# so the default batch size is used as a fixed constant instead.
-LOSS_SCALE = 16.0
-
-
-def yolo_detection_loss(prediction, target, layout, anchor_t=4.0,
-                        box_gain=BOX_GAIN, obj_gain=OBJ_GAIN, loss_scale=LOSS_SCALE):
+def dfl_loss(dist_logits, target_ltrb, reg_max):
     """
-    >>> [YOLOv5-CHANGED] (on top of the YOLOv4 version)
+    >>> [YOLOv10-NEW] Distribution Focal Loss (from YOLOv8).
 
-        Steps:
-        1. Read the one ground-truth box per image out of the target ->
-        2. build_targets(): ratio-matched anchors x (centre + 2 neighbour cells) ->
-        3. Box term = mean(1 - CIoU) over the positives ->
-        4. Objectness: BCE per grid against an IoU-AWARE target, averaged per
-           grid and weighted by OBJ_BALANCE ->
-        5. box_gain * box + obj_gain * obj
-
-    What changed from YOLOv4:
-    - Positives: ratio match + neighbour cells (see build_targets).
-    - Objectness target for a positive is its own CIoU with the truth
-      (clamped at 0), not 1. A badly placed positive box is no longer
-      trained to be confident, so confidence ranks boxes by how good they
-      are -- which is exactly what extract_best_pred_box relies on.
-    - No ignore threshold: with an IoU-valued target it is not needed.
-    - Losses are MEANS (box over positives, objectness over every cell of a
-      grid) with YOLOv5's gains, instead of per-image sums.
+    A side distance of 2.3 cells is taught as "70% bin 2, 30% bin 3":
+    cross-entropy to the two neighbouring bins, weighted by how close the
+    true value is to each. The predicted distribution is pushed to
+    concentrate around the true edge instead of anywhere with the right mean.
+    dist_logits [P, 4, R], target_ltrb [P, 4] in cells -> [P]
     """
-    N, M, _ = prediction.shape
+    t = target_ltrb.clamp(0, reg_max - 1 - 0.01)
+    left = t.long()
+    w_left = (left + 1) - t
+    ce = lambda idx: F.cross_entropy(dist_logits.reshape(-1, reg_max), idx.reshape(-1),
+                                     reduction="none").view_as(t)
+    return (ce(left) * w_left + ce(left + 1) * (1 - w_left)).mean(dim=-1)
+
+
+def head_loss(raw, gt, has_box, layout, topk):
+    """
+    >>> [YOLOv10-NEW] YOLOv8-style loss for ONE head (o2m or o2o):
+        BOX_GAIN * (1 - CIoU)  +  CLS_GAIN * BCE(score, t)  +  DFL_GAIN * DFL
+    Box and DFL terms are weighted by each positive's target t, and all three
+    are divided by the sum of targets, as in YOLOv8.
+    raw [N, M, 4*R + 1] straight from the head.
+    """
+    N, M, _ = raw.shape
+    R = layout["reg_max"]
+    points = layout["points"]
+    S_m = layout["grid"].to(raw.dtype)                                        # [M]
+    dist_logits = raw[..., :4 * R].view(N, M, 4, R)
+    cls_logit = raw[..., 4 * R]
+
+    # decode (with gradient) -- same maths as DetectionHead.decode
+    proj = th.arange(R, device=raw.device, dtype=raw.dtype)
+    ltrb = (dist_logits.softmax(dim=-1) @ proj) / S_m[None, :, None]           # image units
+    x1, y1 = points[:, 0] - ltrb[..., 0], points[:, 1] - ltrb[..., 1]
+    x2, y2 = points[:, 0] + ltrb[..., 2], points[:, 1] + ltrb[..., 3]
+    pred_box = th.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], dim=-1)
+
+    target, pos = task_aligned_assign(pred_box.detach(), cls_logit.detach().sigmoid(),
+                                      gt, has_box, points, topk)
+    tss = target.sum().clamp(min=1.0)
+
+    loss_cls = F.binary_cross_entropy_with_logits(cls_logit, target, reduction="sum") / tss
+
+    loss_box = raw.new_zeros(())
+    loss_dfl = raw.new_zeros(())
+    if pos.any():
+        w = target[pos]
+        g = gt[:, None, :4].expand(N, M, 4)[pos]
+        loss_box = ((1.0 - bbox_ciou(pred_box[pos], g)) * w).sum() / tss
+        p = points[None].expand(N, M, 2)[pos]
+        S_p = S_m[None].expand(N, M)[pos]
+        target_ltrb = th.stack([p[:, 0] - (g[:, 0] - g[:, 2] / 2), p[:, 1] - (g[:, 1] - g[:, 3] / 2),
+                                (g[:, 0] + g[:, 2] / 2) - p[:, 0], (g[:, 1] + g[:, 3] / 2) - p[:, 1]],
+                               dim=1) * S_p[:, None]                          # in cells
+        loss_dfl = (dfl_loss(dist_logits[pos], target_ltrb, R) * w).sum() / tss
+
+    return BOX_GAIN * loss_box + CLS_GAIN * loss_cls + DFL_GAIN * loss_dfl
+
+
+def yolo_detection_loss(prediction, target, layout):
+    """
+    >>> [YOLOv10-CHANGED] consistent dual assignments.
+
+    The same loss is applied to both heads with the same matching metric:
+      one-to-many head  top-10 positives per hand  (rich gradient for the backbone)
+      one-to-one  head  top-1  positive  per hand  (one box per hand, NMS-free)
+    and the two are summed, as in YOLOv10. The one-to-one head reads detached
+    features (see DetectionHead), so its loss only trains its own branch.
+
+    No extra batch-size multiplier: YOLOv8/10 normalise by the sum of targets
+    and then multiply by the batch size; without that multiplier the loss is
+    already per-positive, which keeps train (~3 annotated frames per batch)
+    and val (16 per batch) on the same scale.
+    """
+    K = 4 * layout["reg_max"] + 1
     gt = gt_boxes_from_target(target)                     # [N, 5]
     has_box = gt[:, 4] > 0.5
-    conf = prediction[..., 4]                             # [N, M]
-    obj_target = th.zeros_like(conf)
-
-    loss_box = prediction.new_zeros(())
-    if has_box.any():
-        idx = th.nonzero(has_box).squeeze(1)
-        box_idx, flat = build_targets(gt[idx, :4], layout, anchor_t)
-        img = idx[box_idx]
-        response = prediction[img, flat]                  # [n_pos, 5]
-        ciou = bbox_ciou(response[:, :4], gt[img, :4])
-        loss_box = (1.0 - ciou).mean()
-        obj_target[img, flat] = ciou.detach().clamp(min=0).to(obj_target.dtype)
-
-    loss_obj = prediction.new_zeros(())
-    for S_i, start, end in layout["scales"]:
-        loss_obj = loss_obj + OBJ_BALANCE.get(S_i, 1.0) * _bce(conf[:, start:end],
-                                                                obj_target[:, start:end]).mean()
-
-    # Returning Multi Part loss function
-    return (box_gain * loss_box + obj_gain * loss_obj) * loss_scale
+    o2m = prediction[..., 5:5 + K]
+    o2o = prediction[..., 5 + K:5 + 2 * K]
+    return (head_loss(o2m, gt, has_box, layout, TOPK_O2M) +
+            head_loss(o2o, gt, has_box, layout, TOPK_O2O))
 
 
 def compute_loss(outputs, targets, segmentation_criterion, classification_criterion, lambda_seg=1.0, lambda_cls=1.0, lambda_det=1.0,
-                 layout=None):     # >>> [YOLOv3-CHANGED] anchors -> full multi-scale layout
+                 layout=None):     # >>> [YOLOv3-CHANGED] head layout for the detection loss
     # Computing loss function for each Head defined in models
     detection_pred, segmentation_pred, classification_pred = outputs
 
@@ -240,35 +260,6 @@ def param_groups(model, weight_decay):
             {"params": no_decay, "weight_decay": 0.0}]
 
 
-def check_anchors(data_root, train_persons, anchors, anchor_t=4.0, thr=0.98):
-    """
-    YOLOv5's autoanchor, run once before training: measure how well the
-    anchors cover the TRAINING boxes; if fewer than 98% of boxes can be
-    reached by some anchor (bpr), re-fit k anchors with IoU k-means and keep
-    them only if they are better. The chosen anchors are saved in the
-    checkpoint like before, so evaluation always uses the same ones.
-    """
-    from kmeans_anchors import collect_wh, best_of_n_restarts
-    import numpy as np
-    wh = collect_wh(data_root, set(train_persons))
-    boxes = th.tensor(wh, dtype=th.float32)
-    bpr, aat = anchor_fitness(boxes, anchor_tensor(anchors), anchor_t)
-    print(f"AutoAnchor: {aat:.2f} anchors/target, best possible recall {bpr:.4f}")
-    if bpr >= thr:
-        print("AutoAnchor: current anchors fit the data, keeping them")
-        return anchors
-    new, _ = best_of_n_restarts(np.asarray(wh), len(anchors))
-    new = [(round(float(w), 4), round(float(h), 4)) for w, h in new]
-    new_bpr, new_aat = anchor_fitness(boxes, anchor_tensor(new), anchor_t)
-    print(f"AutoAnchor: re-fitted {len(new)} anchors -> {new_aat:.2f} anchors/target, "
-          f"best possible recall {new_bpr:.4f}")
-    if new_bpr > bpr:
-        print(f"AutoAnchor: using the new anchors {new}")
-        return new
-    print("AutoAnchor: re-fit was not better, keeping the original anchors")
-    return anchors
-
-
 #---------------------------------------------------
 # Train and validation
 #---------------------------------------------------
@@ -294,9 +285,8 @@ def train_one_epoch(model, loader, optimizer, segmentation_criterion,
                     scaler=None, use_amp=False,
                     ema=None, warmup=None):     # >>> [YOLOv5-NEW]
     model.train()
-    # >>> [YOLOv2-NEW] read the anchors off the model, so the loss can never
-    # be matched against a different anchor set from the one the head decoded with
-    # >>> [YOLOv3-CHANGED] ...together with which grid each anchor lives on
+    # Read the head's layout off the model, so the loss can never disagree with
+    # the head it trains. >>> [YOLOv10-CHANGED] anchor points, not anchors.
     layout = model.detecting_head.layout()
     # Accumulate ON DEVICE as tensors -- see the note in compute_loss. These are
     # only pulled back to the host once, after the whole epoch.
@@ -446,37 +436,11 @@ def main():
                         help="final LR = lr * lrf at the end of the cosine schedule")
     parser.add_argument("--ema", dest="ema", action="store_true", default=True)
     parser.add_argument("--no-ema", dest="ema", action="store_false")
-    parser.add_argument("--autoanchor", dest="autoanchor", action="store_true", default=True)
-    parser.add_argument("--no-autoanchor", dest="autoanchor", action="store_false")
     parser.add_argument("--out-dir", type=str, default="weights/")
     parser.add_argument("--seed", type=int, default=42)
-    # >>> [YOLOv2-NEW] anchors from a file beat anchors hand-pasted into utils.py:
-    # on Kaggle/Colab the repo is cloned fresh every run, so editing utils.py by
-    # hand is both awkward and easy to get silently out of date.
-    parser.add_argument("--anchors", type=str, default="",
-                        help="JSON produced by kmeans_anchors.py --out-json; "
-                             "empty means use the ANCHORS list in utils.py")
+    # >>> [YOLOv10-CHANGED] --anchors and --autoanchor are gone: anchor-free.
     # Pack all the top argument into one
     args = parser.parse_args()
-
-    # >>> [YOLOv2-NEW] resolve the anchors BEFORE anything expensive, so a
-    # mismatched split aborts in a second rather than after scanning the dataset.
-    anchors = ANCHORS
-    if args.anchors:
-        with open(args.anchors, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        anchors = [tuple(a) for a in meta["anchors"]]
-        # The split the anchors were fitted on MUST match the split we are about
-        # to train on, otherwise the priors have seen people this run holds out.
-        fitted = meta.get("split", {})
-        here = {"seed": args.seed, "val_frac": args.val_frac, "test_frac": args.test_frac}
-        if fitted and fitted != here:
-            raise SystemExit(
-                f"\nAnchors in {args.anchors} were fitted with split {fitted},\n"
-                f"but you are training with {here}.\n"
-                f"Re-run kmeans_anchors.py with the same --seed/--val-frac/--test-frac.")
-        print(f"Anchors loaded from {args.anchors} "
-              f"(out-of-bag mean best-IoU {meta.get('mean_best_iou_oob', '?')})")
 
     # Keeping the training sample set the same every training at the start
     th.manual_seed(args.seed)
@@ -506,19 +470,12 @@ def main():
         cache_dir=args.cache_dir or None,
     )
     
-    # >>> [YOLOv5-NEW] autoanchor on the TRAIN persons only (same leakage rule
-    # as kmeans_anchors.py)
-    if args.autoanchor:
-        train_persons = {s["Person"] for s in train_loader.dataset.samples}
-        anchors = check_anchors(args.data_root, train_persons, anchors)
-
     #Creating model, optimizer, loss
-    model = HandGestureNet(in_channels=4, n_classes=10, anchors=anchors).to(device)
-    print(f"Detection head: {len(anchors)} anchors (w, h, normalised) = "
-          f"{[(round(a, 3), round(b, 3)) for a, b in anchors]}")
-    # >>> [YOLOv3-NEW] show which anchors went to which grid
-    for S_i, group in zip(model.detecting_head.grids, model.detecting_head.groups):
-        print(f"  {S_i:>2}x{S_i:<2} grid: {[(round(a, 3), round(b, 3)) for a, b in group]}")
+    model = HandGestureNet(in_channels=4, n_classes=10).to(device)
+    # >>> [YOLOv10-CHANGED]
+    head = model.detecting_head
+    print(f"Detection head: anchor-free, grids {head.grids}, {head.n_boxes} points, "
+          f"DFL reg_max {head.reg_max}, one-to-many top-{TOPK_O2M} + one-to-one top-{TOPK_O2O}")
     segmentation_criterion = nn.BCEWithLogitsLoss()
     classification_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)     # >>> [YOLOv4-CHANGED]
     # >>> [YOLOv5-CHANGED] weight decay only on conv/linear weights (param_groups)
@@ -599,9 +556,6 @@ def main():
                 "val_det_loss": val_m["det"],
                 "args": vars(args),
                 "arch": ARCH,     # >>> [YOLOv3-NEW]
-                "anchors": model.anchors_list,     # >>> [YOLOv2-NEW] weights are
-                # meaningless without the anchors they were decoded against, so
-                # they travel together in the same file
             }, output_directory / "best.pth")
             print(f"  ↳ new best (cls_acc {best_val_acc:.3f}, "
                   f"seg {val_m['seg']:.3f}, det {val_m['det']:.3f}), checkpoint saved")
@@ -612,8 +566,7 @@ def main():
 
     # Save the best model/value overall
     th.save({"epoch": args.epochs, "model_state": eval_model.state_dict(),     # >>> [YOLOv5-CHANGED]
-             "arch": ARCH,     # >>> [YOLOv3-NEW]
-             "anchors": model.anchors_list},     # >>> [YOLOv2-NEW]
+             "arch": ARCH},     # >>> [YOLOv3-NEW]
                output_directory / "last.pth")
     print("Training finished.")
 

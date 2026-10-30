@@ -4,7 +4,7 @@ import math
 # Grid of the dataloader's TARGET container (encode_yolo_target). Since YOLOv3
 # the network predicts on several grids (see GRIDS), but the dataset still
 # stores its one ground-truth box in a 7x7 container; the loss reads the box
-# back out of it and re-assigns it to whichever grid/anchor fits best.
+# back out of it and re-assigns it to whichever grid points fit best.
 S = 7
 
 # >>> [YOLOv3-NEW] Prediction grids, coarse -> fine. 448 / 7 = 64 px cells
@@ -15,135 +15,13 @@ S = 7
 # backbone stages are needed.
 GRIDS = (7, 14, 28)
 
-# >>> [YOLOv2-NEW] Anchor priors: (width, height) normalised to the image, so
-# they live in exactly the same [0, 1] space as encode_yolo_target's w, h.
-# YOLOv1 had no anchors at all: each cell regressed B boxes from scratch.
-# YOLOv2's "dimension clusters" replace that guesswork with shapes measured
-# from the data, so the network only has to predict a small correction.
-#
-# Produced by:
-#   python src/kmeans_anchors.py \
-#       --data-root ../data/datasets/dataset_merged_all --seed 42 --k 5
-# on the 7 TRAIN persons only (699 annotated boxes). val/test persons were
-# excluded, otherwise the priors would be fitted on the people we test on.
-#
-# !! These were fitted with the DEFAULT --test-frac 0.1, which holds out 2 people
-# !! and trains on 7. The Kaggle training command uses --test-frac 0, which holds
-# !! out 1 and trains on 8 -- a different split, so this list does NOT match it.
-# !! For that run, pass train.py --anchors <json from kmeans_anchors --out-json>;
-# !! the JSON records the split it was fitted with and train.py refuses to run if
-# !! it disagrees with the split you are training on. This list is only the
-# !! fallback for a --test-frac 0.1 run.
-#
-#   mean best-IoU, in-sample                 0.8049
-#   mean best-IoU, out-of-bag                0.7973 +/- 0.0043   <- honest number
-#   aspect-aware hand-picked baseline (k=5)  0.7761
-#   -> k-means is worth +0.0288 over a baseline that already knows hands are
-#      taller than they are wide. (The +0.16 over SQUARE anchors is a straw man.)
-#
-# If you change --k or the split, RE-RUN the script and repaste. The numbers
-# above are the claim; do not let them drift from the list below.
-#
-# >>> [YOLOv3-NOTE] YOLOv3 uses 9 anchors, 3 per scale. These 5 are still the
-# k=5 YOLOv2 clusters, because they are the only ones that were actually
-# measured on the data -- inventing 4 more would be making numbers up.
-# split_anchors_by_scale() spreads whatever list it is given over GRIDS, so
-# 5 anchors run as 2 / 2 / 1 (7x7 / 14x14 / 28x28). For the real YOLOv3
-# setting run:
-#   python src/kmeans_anchors.py --data-root ... --k 9 --out-json anchors9.json
-# and train with --anchors anchors9.json (3 / 3 / 3).
-ANCHORS = [
-    (0.0826, 0.1763),
-    (0.1429, 0.2388),
-    (0.1585, 0.3237),
-    (0.2143, 0.2656),
-    (0.2210, 0.3929),
-]
-
-
-# >>> [YOLOv2-NEW]
-def anchor_tensor(anchors=None, device=None, dtype=th.float32):
-    """(A, 2) tensor of anchor (w, h). One place, so nothing drifts."""
-    if anchors is None:
-        anchors = ANCHORS
-    return th.tensor([tuple(a) for a in anchors], dtype=dtype, device=device)
-
-
-# >>> [YOLOv3-NEW]
-def split_anchors_by_scale(anchors, n_scales=len(GRIDS)):
-    """
-    YOLOv3's anchor-to-scale assignment: sort the anchors by AREA, give the
-    largest ones to the coarsest grid and the smallest ones to the finest.
-
-    A 7x7 cell is 64 px wide and sees a big receptive field, so it should
-    predict big boxes; a 28x28 cell is 16 px and should predict small ones.
-    YOLOv3 hard-codes this with its "mask = 6,7,8 / 3,4,5 / 0,1,2" lines;
-    here it is derived from the list so changing --k can never mis-assign.
-
-    Returns a list of n_scales lists of (w, h), coarse grid first (same order
-    as GRIDS). With 9 anchors that is 3 / 3 / 3; with 5 it is 2 / 2 / 1.
-    """
-    anchors = [tuple(float(v) for v in a) for a in anchors]
-    if len(anchors) < n_scales:
-        raise ValueError(f"need at least {n_scales} anchors for {n_scales} scales, "
-                         f"got {len(anchors)}")
-    ordered = sorted(anchors, key=lambda a: a[0] * a[1], reverse=True)
-    base, extra = divmod(len(ordered), n_scales)
-    groups, start = [], 0
-    for i in range(n_scales):
-        n = base + (1 if i < extra else 0)
-        groups.append(ordered[start:start + n])
-        start += n
-    return groups
-
-
-# >>> [YOLOv5-NEW]
-def anchor_ratio_metric(boxes_wh, anchors_wh):
-    """
-    YOLOv5's anchor-match metric between (M,2) box (w,h) and (A,2) anchors:
-    for each pair, the WORSE of the width and height ratios, folded into
-    (0, 1] (1 = same size, 0.25 = 4x bigger or smaller on some side).
-
-    YOLOv5 replaced shape-IoU with this for target assignment because it
-    matches what the head can physically do: a box can be predicted from an
-    anchor only if it is within 4x of it on both sides (see the decode,
-    w = anchor_w * (2 * sigmoid)^2 <= 4 * anchor_w).
-    """
-    r = boxes_wh[:, None, :] / anchors_wh[None, :, :]
-    return th.min(r, 1.0 / r).min(dim=2).values
-
-
-# >>> [YOLOv5-NEW]
-def anchor_fitness(boxes_wh, anchors_wh, anchor_t=4.0):
-    """
-    YOLOv5 autoanchor's check. Returns
-      bpr  "best possible recall": fraction of boxes that at least one anchor
-           can predict (ratio within anchor_t)
-      aat  average number of anchors that can predict each box
-    """
-    x = anchor_ratio_metric(boxes_wh, anchors_wh)
-    bpr = (x.max(dim=1).values > 1.0 / anchor_t).float().mean().item()
-    aat = (x > 1.0 / anchor_t).float().sum(dim=1).mean().item()
-    return bpr, aat
-
-
-# >>> [YOLOv2-NEW]
-def shape_iou(boxes_wh, anchors_wh):
-    """
-    IoU between (M,2) ground-truth (w,h) and (A,2) anchor (w,h), pretending
-    both are centred on the same point.
-
-    This is SHAPE-only IoU, used to decide which anchor is "responsible" for a
-    ground-truth box. YOLOv1 decided that by asking which of its B predictions
-    happened to overlap best, which is circular: at the start of training the
-    predictions are random, so the assignment is random too. Matching on shape
-    is stable from epoch 1.
-    """
-    inter = (th.minimum(boxes_wh[:, None, 0], anchors_wh[None, :, 0]) *
-             th.minimum(boxes_wh[:, None, 1], anchors_wh[None, :, 1]))
-    area_b = (boxes_wh[:, 0] * boxes_wh[:, 1])[:, None]
-    area_a = (anchors_wh[:, 0] * anchors_wh[:, 1])[None, :]
-    return inter / (area_b + area_a - inter + 1e-9)
+# >>> [YOLOv10-CHANGED] The anchor machinery that lived here since YOLOv2
+# (ANCHORS, anchor_tensor, shape_iou, split_anchors_by_scale and YOLOv5's
+# anchor_ratio_metric / anchor_fitness) is gone: YOLOv10 is anchor-free, every
+# grid-cell centre predicts its distances to the four box sides directly.
+# The k=5 clusters measured for YOLOv2 were
+#   (0.0826, 0.1763) (0.1429, 0.2388) (0.1585, 0.3237) (0.2143, 0.2656) (0.2210, 0.3929)
+# and remain on the yolov2..yolov5 branches.
 
 
 def compute_intersection_over_union(box1, box2):
@@ -239,7 +117,12 @@ def decode_predictions(prediction, B=None, conf_thresh=0.25, s=S):
     matters here. reshape(-1, 5) also still accepts the old [S, S, B*5] layout,
     which is why `B` and `s` are kept but ignored.
     """
-    prediction = prediction.reshape(-1, 5)
+    # >>> [YOLOv10-CHANGED] the head output carries the raw one-to-many /
+    # one-to-one logits after the first 5 channels; only the first 5 (the
+    # decoded one-to-one boxes) are boxes. Thanks to the one-to-one head
+    # these need NO non-maximum suppression: it is trained to give each hand
+    # exactly one high score.
+    prediction = prediction.reshape(-1, prediction.shape[-1])[:, :5]
     keep = prediction[:, 4] >= conf_thresh
     boxes = [(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, conf)
              for cx, cy, w, h, conf in prediction[keep].tolist()]
@@ -267,5 +150,6 @@ def extract_best_pred_box(det_pred, B=None):
     argmax runs over every box at every scale, so a big hand found on the 7x7
     grid and a small one found on the 28x28 grid compete on confidence alone.
     """
-    det_pred = det_pred.reshape(-1, 5)
+    # >>> [YOLOv10-CHANGED] first 5 channels = decoded one-to-one boxes
+    det_pred = det_pred.reshape(-1, det_pred.shape[-1])[:, :5]
     return det_pred[det_pred[:, 4].argmax(), :4]

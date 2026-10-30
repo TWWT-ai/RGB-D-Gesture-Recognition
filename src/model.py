@@ -3,53 +3,55 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# >>> [YOLOv2-NEW] anchor priors live in utils.py so the loss, the head and
-# kmeans_anchors.py all read the same numbers.
-from utils import ANCHORS, anchor_tensor
-from utils import GRIDS, split_anchors_by_scale     # >>> [YOLOv3-NEW]
+from utils import GRIDS     # >>> [YOLOv3-NEW]
+# >>> [YOLOv10-CHANGED] ANCHORS / anchor_tensor / split_anchors_by_scale are no
+# longer imported: YOLOv10 is ANCHOR-FREE (inherited from YOLOv8). Every grid
+# cell centre is a point that predicts its distances to the four box sides.
 
-# >>> [YOLOv3-NEW] written into every checkpoint. A YOLOv2 checkpoint has a
-# completely different detection head, so loading one here should fail with a
-# sentence, not with 40 lines of "unexpected key in state_dict".
-ARCH = "yolov5"     # >>> [YOLOv5-CHANGED]
+# >>> [YOLOv3-NEW] written into every checkpoint, so a checkpoint from another
+# branch fails with a sentence instead of 40 lines of state_dict key errors.
+ARCH = "yolov10"     # >>> [YOLOv10-CHANGED]
 
-# >>> [YOLOv4-NEW] YOLOv4's backbone (CSPDarknet53) uses Mish,
-# x * tanh(softplus(x)), instead of LeakyReLU. It is smooth and lets a little
-# negative signal through, which the paper found worth ~+1% top-1 on the
-# backbone. The neck and the other heads keep LeakyReLU, as in YOLOv4.
-#
-# >>> [YOLOv5-CHANGED] YOLOv5 uses SiLU, x * sigmoid(x), in the backbone AND
-# the neck. Same smooth shape as Mish, cheaper to compute. The segmentation
-# head still uses the "leaky" default, so it is untouched.
+# >>> [YOLOv10-NEW] Distribution Focal Loss bins (YOLOv8 / YOLOv10 default).
+# Each box side is predicted as a probability distribution over 0..15 grid
+# cells instead of one number; the side length is that distribution's mean.
+REG_MAX = 16
+
+
+# YOLOv4 put Mish in the backbone, YOLOv5 moved everything to SiLU; YOLOv8 /
+# YOLOv10 keep SiLU. The segmentation head still uses the "leaky" default.
 def activation(name="leaky"):
     if name == "mish":
         return nn.Mish(inplace=True)
     if name == "silu":
         return nn.SiLU(inplace=True)
+    if name == "none":     # >>> [YOLOv10-NEW] SCDown / attention use linear convs
+        return nn.Identity()
     return nn.LeakyReLU(0.1, inplace=True)
 
 
-def conv_block(channel_in, channel_out, k=3, s=1, act="leaky", p=None):     # >>> [YOLOv4-CHANGED] added `act`, [YOLOv5] `p`
+def conv_block(channel_in, channel_out, k=3, s=1, act="leaky", p=None, g=1):     # >>> [YOLOv10-CHANGED] added `g` (groups)
     # s=1 only thickening, s=2 shrinking and thickening
     return nn.Sequential(
         # Converting the picture into thinkened and shrinked picture
-        nn.Conv2d(channel_in, channel_out, k, stride=s, padding=(k // 2) if p is None else p, bias=False),
+        nn.Conv2d(channel_in, channel_out, k, stride=s, padding=(k // 2) if p is None else p,
+                  groups=g, bias=False),
         nn.BatchNorm2d(channel_out),
         activation(act)
     )
 
 
-# >>> [YOLOv5-CHANGED] YOLOv3's residual block, renamed to what YOLOv5 calls
-# it. `shortcut=False` is used in the neck, where the input and output mean
-# different things (concatenated features from two scales), so adding them
-# would be wrong.
+# ---------------------------------------------------------------------------
+# >>> [YOLOv10-NEW] building blocks
+# ---------------------------------------------------------------------------
+
 class Bottleneck(nn.Module):
+    # YOLOv8's bottleneck: 3x3 -> 3x3, plus the input when shortcut=True.
+    # (YOLOv5's was 1x1 -> 3x3.)
     def __init__(self, channels, shortcut=True, act="silu"):
         super().__init__()
-        self.net = nn.Sequential(
-            conv_block(channels, channels, k=1, act=act),
-            conv_block(channels, channels, k=3, act=act),
-        )
+        self.net = nn.Sequential(conv_block(channels, channels, k=3, act=act),
+                                 conv_block(channels, channels, k=3, act=act))
         self.shortcut = shortcut
 
     def forward(self, x):
@@ -57,35 +59,94 @@ class Bottleneck(nn.Module):
         return x + y if self.shortcut else y
 
 
-class C3(nn.Module):
-    # >>> [YOLOv5-NEW] YOLOv5's CSP block, replacing YOLOv4's CSPStage.
+class C2f(nn.Module):
+    # YOLOv8's replacement for YOLOv5's C3 (kept by YOLOv10).
     #
-    #   x --1x1--> n Bottlenecks --+
-    #                              concat --1x1--> out
-    #   x --1x1--------------------+
+    #   x --1x1--> split --+----------------------------------------+
+    #                      +--> block1 --+--> block2 --+--> ...     |
+    #                                    |             |            |
+    #                      concat(every intermediate output) --1x1--> out
     #
-    # Same cross-stage idea as YOLOv4 (half the channels skip the blocks), with
-    # one fewer conv: YOLOv4 put an extra 1x1 after the blocks, YOLOv5 found
-    # it was not needed. Used in the backbone (with shortcuts) AND the neck
-    # (without), so the whole network is built from one block type.
-    def __init__(self, channel_in, channel_out, n=1, shortcut=True, act="silu"):
+    # C3 only kept the LAST block's output; C2f concatenates every block's
+    # output, so the final 1x1 sees features at every depth and the gradient
+    # has a short path to each block (the "f" is for the ELAN-style fan-out).
+    def __init__(self, channel_in, channel_out, n=1, shortcut=False, act="silu", block=None):
         super().__init__()
-        half = channel_out // 2
-        self.cv1 = conv_block(channel_in, half, k=1, act=act)
-        self.cv2 = conv_block(channel_in, half, k=1, act=act)
-        self.m = nn.Sequential(*[Bottleneck(half, shortcut, act) for _ in range(n)])
-        self.cv3 = conv_block(2 * half, channel_out, k=1, act=act)
+        self.c = channel_out // 2
+        self.cv1 = conv_block(channel_in, 2 * self.c, k=1, act=act)
+        self.cv2 = conv_block((2 + n) * self.c, channel_out, k=1, act=act)
+        make = block or (lambda c: Bottleneck(c, shortcut, act))
+        self.m = nn.ModuleList(make(self.c) for _ in range(n))
 
     def forward(self, x):
-        return self.cv3(th.cat([self.m(self.cv1(x)), self.cv2(x)], dim=1))
+        y = list(self.cv1(x).chunk(2, dim=1))
+        for m in self.m:
+            y.append(m(y[-1]))
+        return self.cv2(th.cat(y, dim=1))
+
+
+class SCDown(nn.Module):
+    # YOLOv10's "spatial-channel decoupled downsampling".
+    # A normal stride-2 3x3 conv changes the resolution AND the channel count
+    # in one dense op: k*k*C_in*C_out weights. SCDown does the two jobs
+    # separately -- a 1x1 for channels, then a DEPTHWISE stride-2 3x3 for
+    # resolution -- which costs C_in*C_out + k*k*C_out, and keeps more
+    # information through the downsample (the paper's ablation).
+    def __init__(self, channel_in, channel_out, k=3, s=2, act="silu"):
+        super().__init__()
+        self.cv1 = conv_block(channel_in, channel_out, k=1, act=act)
+        self.cv2 = conv_block(channel_out, channel_out, k=k, s=s, g=channel_out, act="none")
+
+    def forward(self, x):
+        return self.cv2(self.cv1(x))
+
+
+class RepVGGDW(nn.Module):
+    # YOLOv10's large-kernel depthwise conv: a 7x7 and a 3x3 depthwise branch
+    # added together. The 3x3 branch helps optimisation early on; the two can
+    # be folded into one 7x7 for deployment (not done here, it is only a speed
+    # optimisation and the output is identical).
+    def __init__(self, channels):
+        super().__init__()
+        self.conv7 = conv_block(channels, channels, k=7, g=channels, act="none")
+        self.conv3 = conv_block(channels, channels, k=3, g=channels, act="none")
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.conv7(x) + self.conv3(x))
+
+
+class CIB(nn.Module):
+    # YOLOv10's "compact inverted block": depthwise 3x3 for space, pointwise
+    # 1x1 for channels, alternated. YOLOv10's rank analysis found that the
+    # deepest stages of YOLOv8 are redundant (low-rank weights), so it swaps
+    # their dense 3x3 bottlenecks for this much cheaper block.
+    # lk=True uses the 7x7 RepVGGDW in the middle -- a bigger receptive field
+    # for almost no cost, which the paper uses in the deep stage of small models.
+    def __init__(self, channel_in, channel_out, shortcut=True, e=0.5, lk=False, act="silu"):
+        super().__init__()
+        hidden = int(channel_out * e)
+        self.net = nn.Sequential(
+            conv_block(channel_in, channel_in, k=3, g=channel_in, act=act),
+            conv_block(channel_in, 2 * hidden, k=1, act=act),
+            RepVGGDW(2 * hidden) if lk else conv_block(2 * hidden, 2 * hidden, k=3, g=2 * hidden, act=act),
+            conv_block(2 * hidden, channel_out, k=1, act=act),
+            conv_block(channel_out, channel_out, k=3, g=channel_out, act=act),
+        )
+        self.add = shortcut and channel_in == channel_out
+
+    def forward(self, x):
+        y = self.net(x)
+        return x + y if self.add else y
+
+
+def C2fCIB(channel_in, channel_out, n=1, shortcut=True, lk=False):
+    # YOLOv10: C2f with CIB blocks instead of bottlenecks (deep stages only)
+    return C2f(channel_in, channel_out, n, block=lambda c: CIB(c, c, shortcut, e=1.0, lk=lk))
 
 
 class SPPF(nn.Module):
-    # >>> [YOLOv5-NEW] "SPP-Fast", replacing YOLOv4's SPP. Three 5x5 max-pools
-    # in a row see 5x5, 9x9 and 13x13 windows -- mathematically the same
-    # output as SPP(5, 9, 13), because max-pooling a max-pool widens the
-    # window -- but each pool reuses the previous one's work, so it is ~2x
-    # faster. A 1x1 halves the channels first to keep the concat small.
+    # From YOLOv5: three 5x5 max-pools in series == SPP(5, 9, 13), ~2x faster.
     def __init__(self, channel_in, channel_out, k=5, act="silu"):
         super().__init__()
         hidden = channel_in // 2
@@ -100,31 +161,72 @@ class SPPF(nn.Module):
         return self.cv2(th.cat([x, y1, y2, self.pool(y2)], dim=1))
 
 
-def stage(channel_in, channel_out, n_blocks):
-    # >>> [YOLOv5-CHANGED] stride-2 conv + C3 (was CSPStage + Mish in YOLOv4)
-    return nn.Sequential(conv_block(channel_in, channel_out, s=2, act="silu"),
-                         C3(channel_out, channel_out, n_blocks))
+class Attention(nn.Module):
+    # Multi-head self-attention over the cells of a feature map, as in
+    # YOLOv10's PSA. A depthwise 3x3 on the values acts as the positional
+    # encoding, so no learned position table is needed and any map size works.
+    def __init__(self, dim, num_heads=8, attn_ratio=0.5):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim ** -0.5
+        self.qkv = conv_block(dim, dim + 2 * self.key_dim * num_heads, k=1, act="none")
+        self.proj = conv_block(dim, dim, k=1, act="none")
+        self.pe = conv_block(dim, dim, k=3, g=dim, act="none")
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        q, k, v = self.qkv(x).view(N, self.num_heads, 2 * self.key_dim + self.head_dim, H * W).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2)
+        attn = ((q.transpose(-2, -1) @ k) * self.scale).softmax(dim=-1)        # [N, heads, HW, HW]
+        out = (v @ attn.transpose(-2, -1)).view(N, C, H, W) + self.pe(v.reshape(N, C, H, W))
+        return self.proj(out)
+
+
+class PSA(nn.Module):
+    # YOLOv10's "partial self-attention". Self-attention is the best tool for
+    # GLOBAL context (where is the hand relative to the whole frame) but it
+    # is quadratic in the number of cells, so YOLOv10 uses it once, on the
+    # smallest map, and only on HALF the channels: the other half passes
+    # through untouched and is concatenated back. On our 7x7 map that is 49
+    # tokens -- attention there is nearly free.
+    def __init__(self, channels, e=0.5):
+        super().__init__()
+        self.c = int(channels * e)
+        self.cv1 = conv_block(channels, 2 * self.c, k=1, act="silu")
+        self.cv2 = conv_block(2 * self.c, channels, k=1, act="silu")
+        self.attn = Attention(self.c, num_heads=max(1, self.c // 64), attn_ratio=0.5)
+        self.ffn = nn.Sequential(conv_block(self.c, 2 * self.c, k=1, act="silu"),
+                                 conv_block(2 * self.c, self.c, k=1, act="none"))
+
+    def forward(self, x):
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = b + self.attn(b)
+        b = b + self.ffn(b)
+        return self.cv2(th.cat([a, b], dim=1))
 
 
 class Backbone(nn.Module):
-    # >>> [YOLOv5-CHANGED] CSPDarknet with C3 blocks + SiLU (YOLOv5 v6+).
-    # Stem: ONE 6x6 stride-2 conv (padding 2), which is what YOLOv5 v6.0
-    # replaced its old "Focus" slice-and-concat layer with -- same output
-    # size, same receptive field, but a plain conv that exports and runs
-    # faster everywhere. Then 5 stages of stride-2 conv + C3.
-    # depths (1, 2, 3, 3, 1) follows YOLOv5's 3 : 6 : 9 : 3 stage pattern at
-    # small-model depth. Resolutions / channels / outputs are unchanged, so
-    # the segmentation and classification heads see the same tensors as before.
-    def __init__(self, in_channels=4, depths=(1, 2, 3, 3, 1)):
+    # >>> [YOLOv10-CHANGED] YOLOv10 backbone (YOLOv8 layout + YOLOv10 blocks):
+    #   s1        3x3 stride-2 conv stem (YOLOv8 went back from 6x6 to 3x3)
+    #   s2 .. s4  stride-2 conv + C2f
+    #   s5, s6    SCDown + C2f / C2fCIB(lk=True) in the deepest stage
+    # SCDown and CIB only in the deep stages is the paper's rank-guided design:
+    # that is where the dense blocks were found to be redundant.
+    # Resolutions / channels / outputs are unchanged (f56, f28, f14, f7), so
+    # the segmentation and classification heads see the same tensors.
+    # depths (1, 1, 2, 2, 1): YOLOv8/10's 3 : 6 : 6 : 3 pattern at small-model depth.
+    def __init__(self, in_channels=4, depths=(1, 1, 2, 2, 1)):
         super().__init__()
         # Reducing the pixels into 7x7 (448 / 2^6)
         # 7x7 being the box of determining the size of the grid cell
-        self.s1 = conv_block(in_channels, 32, k=6, s=2, p=2, act="silu")
-        self.s2 = stage(32, 64, depths[0])
-        self.s3 = stage(64, 128, depths[1])
-        self.s4 = stage(128, 256, depths[2])
-        self.s5 = stage(256, 512, depths[3])
-        self.s6 = stage(512, 1024, depths[4])
+        self.s1 = conv_block(in_channels, 32, k=3, s=2, act="silu")
+        self.s2 = nn.Sequential(conv_block(32, 64, s=2, act="silu"), C2f(64, 64, depths[0], shortcut=True))
+        self.s3 = nn.Sequential(conv_block(64, 128, s=2, act="silu"), C2f(128, 128, depths[1], shortcut=True))
+        self.s4 = nn.Sequential(conv_block(128, 256, s=2, act="silu"), C2f(256, 256, depths[2], shortcut=True))
+        self.s5 = nn.Sequential(SCDown(256, 512), C2f(512, 512, depths[3], shortcut=True))
+        self.s6 = nn.Sequential(SCDown(512, 1024), C2fCIB(1024, 1024, depths[4], shortcut=True, lk=True))
 
 
     def forward(self, x):
@@ -138,187 +240,159 @@ class Backbone(nn.Module):
 
 
 class PANNeck(nn.Module):
-    # >>> [YOLOv5-CHANGED] same PANet shape as YOLOv4 (top-down, then
-    # bottom-up, merged by concatenation) but built from C3 blocks with SiLU
-    # instead of plain conv_sets, and with SPPF instead of SPP on top.
-    # The neck also no longer narrows the channels as it goes up: the outputs
-    # are 256 / 512 / 1024 for 28x28 / 14x14 / 7x7, like YOLOv5's P3 / P4 / P5.
+    # >>> [YOLOv10-CHANGED] YOLOv10's neck: SPPF -> PSA on the 7x7 map, then
+    # the YOLOv8 PAN (top-down, then bottom-up, concat merges) built from C2f,
+    # with SCDown + C2fCIB on the last, deepest bottom-up step.
+    # (In YOLOv10 SPPF + PSA sit at the end of the backbone. They are kept in
+    # the neck here, as on the earlier branches, so the classification and
+    # segmentation heads keep reading the plain backbone f7.)
     #
-    #   f7 -> SPPF -> 1x1 (h7) -----------------------------------> concat -> C3 -> n7   (7x7 head)
-    #                  |                                              ^
-    #                  up x2                                          3x3 s2
-    #                  v                                              |
-    #   f14 ------> concat -> C3 -> 1x1 (h14) ------------------> concat -> C3 -> n14  (14x14 head)
-    #                                |                    ^
-    #                                up x2                3x3 s2
-    #                                v                    |
-    #   f28 ----------------------> concat -> C3 -> n28 --+                          (28x28 head)
-    def __init__(self, n=1, act="silu"):
+    #   f7 -> SPPF -> PSA (x7) -----------------------------------> concat -> C2fCIB -> n7  (7x7)
+    #                  |                                               ^
+    #                  up x2                                           SCDown
+    #                  v                                               |
+    #   f14 ------> concat -> C2f -> t14 ------------------------> concat -> C2f -> n14   (14x14)
+    #                                 |                    ^
+    #                                 up x2                3x3 s2
+    #                                 v                    |
+    #   f28 -----------------------> concat -> C2f -> n28 -+                           (28x28)
+    def __init__(self, n=1):
         super().__init__()
-        self.sppf = SPPF(1024, 1024, act=act)
-        self.h7 = conv_block(1024, 512, k=1, act=act)
-        self.td14 = C3(512 + 512, 512, n, shortcut=False, act=act)
-        self.h14 = conv_block(512, 256, k=1, act=act)
-        self.td28 = C3(256 + 256, 256, n, shortcut=False, act=act)
-        self.down28 = conv_block(256, 256, s=2, act=act)
-        self.bu14 = C3(256 + 256, 512, n, shortcut=False, act=act)
-        self.down14 = conv_block(512, 512, s=2, act=act)
-        self.bu7 = C3(512 + 512, 1024, n, shortcut=False, act=act)
+        self.sppf = SPPF(1024, 1024)
+        self.psa = PSA(1024)
+        self.td14 = C2f(1024 + 512, 512, n)
+        self.td28 = C2f(512 + 256, 256, n)
+        self.down28 = conv_block(256, 256, s=2, act="silu")
+        self.bu14 = C2f(256 + 512, 512, n)
+        self.down14 = SCDown(512, 512)
+        self.bu7 = C2fCIB(512 + 1024, 1024, n, shortcut=True, lk=True)
         self.out_channels = (1024, 512, 256)    # n7, n14, n28
 
     def forward(self, f28, f14, f7):
-        h7 = self.h7(self.sppf(f7))
-        h14 = self.h14(self.td14(th.cat([F.interpolate(h7, scale_factor=2), f14], dim=1)))
-        n28 = self.td28(th.cat([F.interpolate(h14, scale_factor=2), f28], dim=1))
-        n14 = self.bu14(th.cat([self.down28(n28), h14], dim=1))
-        n7 = self.bu7(th.cat([self.down14(n14), h7], dim=1))
+        x7 = self.psa(self.sppf(f7))
+        t14 = self.td14(th.cat([F.interpolate(x7, scale_factor=2), f14], dim=1))
+        n28 = self.td28(th.cat([F.interpolate(t14, scale_factor=2), f28], dim=1))
+        n14 = self.bu14(th.cat([self.down28(n28), t14], dim=1))
+        n7 = self.bu7(th.cat([self.down14(n14), x7], dim=1))
         return n7, n14, n28
 
 
 class DetectionHead(nn.Module):
-    # >>> [YOLOv2-CHANGED] Was: B free boxes per cell, raw regression (YOLOv1).
-    # Now: one prediction per ANCHOR, and the raw numbers are read as
-    # CORRECTIONS to that anchor rather than as the box itself.
-    #   bx = (sigmoid(tx) + col) / S      centre is locked inside its own cell
-    #   by = (sigmoid(ty) + row) / S
-    #   bw = anchor_w * exp(tw)           width is a multiple of the prior
-    #   bh = anchor_h * exp(th)
-    #   conf = sigmoid(to)                confidence is forced into [0, 1]
-    # This is YOLOv2's "direct location prediction". YOLOv1 let the network
-    # output any number for cx, so early in training a box could be predicted
-    # on the other side of the image and the model took many epochs to settle.
-    # The sigmoid makes that impossible by construction.
+    # >>> [YOLOv10-CHANGED] rewritten. History of this class:
+    #   YOLOv1  B free boxes per 7x7 cell
+    #   YOLOv2  one box per ANCHOR, decoded as a correction to the anchor
+    #   YOLOv3  three grids, anchors split over them
+    #   YOLOv5  bounded decode, objectness trained towards IoU
+    #   YOLOv10 (this) -- ANCHOR-FREE, DECOUPLED, DUAL-HEAD, NMS-FREE:
     #
-    # >>> [YOLOv3-CHANGED] Was: one 7x7 grid with every anchor on it.
-    # Now: three grids (GRIDS = 7, 14, 28) fed by the FPN neck, and each
-    # anchor lives on exactly ONE of them (split_anchors_by_scale). The decode
-    # formula above is unchanged, it is just applied per grid with that grid's
-    # S. All boxes from all grids are then flattened into one [N, M, 5]
-    # tensor of (cx, cy, w, h, conf) in [0, 1], so evaluate.py, visualize.py
-    # and the web demo still just pick the most confident row.
+    # * Anchor-free (from YOLOv8). Every cell centre (col + 0.5, row + 0.5) is
+    #   a point; it predicts the distances (l, t, r, b) to the four box sides.
+    #   No priors to fit, so no k-means and no autoanchor any more.
+    # * DFL box regression (from YOLOv8). Each distance is a softmax over
+    #   REG_MAX bins (0..15 cells); the distance is its expected value. A
+    #   distribution can say "the edge is between 2 and 3 cells away", which
+    #   suits blurry hand edges better than one regressed number.
+    # * Decoupled head (from YOLOv8). Separate conv branches for the box and
+    #   for the score. YOLOv10 makes the score branch LIGHTWEIGHT (depthwise
+    #   3x3 + pointwise 1x1, twice): its analysis found the classification
+    #   branch needs far less capacity than the regression one.
+    # * No separate objectness. The score is the "hand" class probability,
+    #   trained towards an IoU-aware target (task alignment, see train.py).
+    # * Dual heads ("consistent dual assignments"):
+    #     one-to-many (o2m)  trained with the top-10 points per hand -> rich
+    #                        supervision for the backbone
+    #     one-to-one  (o2o)  an identical copy trained with the top-1 point per
+    #                        hand -> exactly one confident box per hand, so no
+    #                        NMS is needed at inference
+    #   Both use the SAME matching metric, so the o2o head's best point is also
+    #   the o2m head's best point. The o2o head reads DETACHED features: only
+    #   the o2m head trains the backbone, as in YOLOv10.
     #
-    # >>> [YOLOv4-CHANGED] "eliminate grid sensitivity": stretch the sigmoid a
-    # little past [0, 1] so a centre on a cell border is reachable.
-    #
-    # >>> [YOLOv5-CHANGED] new decode:
-    #   bx = (2 * sigmoid(tx) - 0.5 + col) / S     centre in (col - 0.5, col + 1.5)
-    #   bw = anchor_w * (2 * sigmoid(tw)) ** 2     width in (0, 4 * anchor_w)
-    # - The centre range is wide enough that a cell can also predict a hand
-    #   centred in the NEIGHBOURING cell, which the loss now uses to give
-    #   every hand three positive cells instead of one (see build_targets).
-    # - exp(tw) is gone. exp is unbounded, which is why every earlier branch
-    #   had to bound tw to +-4 (hard clamp on v2, 4 * tanh(tw / 4) since v3);
-    #   (2 * sigmoid)^2 is bounded by construction at 4x the anchor --
-    #   matching the anchor_t = 4 rule the loss uses to decide which anchors
-    #   may predict a box at all.
-    def __init__(self, B=2, anchors=None, in_channels=(1024, 512, 256), grids=GRIDS):
+    # Output, one tensor [N, M, 5 + 2 * (4 * REG_MAX + 1)], M = 28^2 + 14^2 + 7^2:
+    #   [..., 0:5]  o2o boxes, decoded: (cx, cy, w, h, score) in [0, 1]
+    #               -> what evaluate.py / visualize.py / the demo use
+    #   [..., 5:5+K]  o2m raw: 4*REG_MAX side logits + 1 score logit   (loss only)
+    #   [..., 5+K:]   o2o raw, same layout                             (loss only)
+    # A single tensor (not a dict) so _forward_fp32 and the DataLoader-style
+    # tuple handling in train.py keep working unchanged.
+    def __init__(self, in_channels=(1024, 512, 256), grids=GRIDS, reg_max=REG_MAX):
         super().__init__()
-        # `B` is kept only so old call sites do not crash; the real count is
-        # the number of anchors.
-        self.anchors_list = [tuple(a) for a in (ANCHORS if anchors is None else anchors)]
         self.grids = tuple(grids)
-        self.groups = split_anchors_by_scale(self.anchors_list, len(self.grids))
-        self.B = len(self.anchors_list)
-        # register_buffer: moves with .to(device) and is saved in the
-        # checkpoint, so an evaluation run can never use different anchors
-        # from the run that trained the weights.
-        # >>> [YOLOv3-CHANGED] stored in GROUPED order (coarse grid first),
-        # which is the order the boxes come out in.
-        self.register_buffer("anchors", anchor_tensor([a for g in self.groups for a in g]))
+        self.reg_max = reg_max
+        self.n_raw = 4 * reg_max + 1
+        c_box = max(16, in_channels[-1] // 4, reg_max * 4)
+        c_cls = max(in_channels[-1], 1)
+        self.o2m_box = nn.ModuleList(self._box_branch(c, c_box) for c in in_channels)
+        self.o2m_cls = nn.ModuleList(self._cls_branch(c, c_cls) for c in in_channels)
+        self.o2o_box = nn.ModuleList(self._box_branch(c, c_box) for c in in_channels)
+        self.o2o_cls = nn.ModuleList(self._cls_branch(c, c_cls) for c in in_channels)
+        self._init_bias()
 
-        # >>> [YOLOv5-CHANGED] one 1x1 conv per scale emitting (tx, ty, tw, th,
-        # to) for each anchor (YOLOv5's Detect layer). YOLOv3/4 had an extra 3x3
-        # here; YOLOv5's C3 neck already ends in a 3x3, so it was redundant.
-        self.preds = nn.ModuleList()
-        for c, group in zip(in_channels, self.groups):
-            self.preds.append(nn.Sequential(nn.Conv2d(c, len(group) * 5, kernel_size=1)))
-        self._init_objectness_bias()
+        # Anchor POINTS: centre of every cell of every grid, coarse grid first,
+        # normalised to [0, 1], plus the grid size each point belongs to.
+        points, grid_of = [], []
+        for S in self.grids:
+            r, c = th.meshgrid(th.arange(S), th.arange(S), indexing="ij")
+            points.append(th.stack([(c.flatten() + 0.5) / S, (r.flatten() + 0.5) / S], dim=1))
+            grid_of.append(th.full((S * S,), S))
+        self.register_buffer("points", th.cat(points).float(), persistent=False)
+        self.register_buffer("point_grid", th.cat(grid_of), persistent=False)
+        self.register_buffer("proj", th.arange(reg_max).float(), persistent=False)
+        self.n_boxes = self.points.size(0)
 
-        # --- per-anchor bookkeeping the loss needs ---------------------------
-        # For anchor a (in grouped order): the grid it lives on, where its
-        # scale starts in the flattened output, its index inside that scale and
-        # how many anchors share the scale. Flat index of (anchor, row, col):
-        #   offset[a] + (row * S[a] + col) * count[a] + local[a]
-        grid_of, offset_of, local_of, count_of = [], [], [], []
-        offset = 0
-        for S_i, group in zip(self.grids, self.groups):
-            for j in range(len(group)):
-                grid_of.append(S_i)
-                offset_of.append(offset)
-                local_of.append(j)
-                count_of.append(len(group))
-            offset += S_i * S_i * len(group)
-        self.n_boxes = offset
-        # persistent=False: derived from the anchors, so there is nothing to
-        # save and old/new checkpoints stay key-compatible.
-        self.register_buffer("anchor_grid", th.tensor(grid_of), persistent=False)
-        self.register_buffer("anchor_offset", th.tensor(offset_of), persistent=False)
-        self.register_buffer("anchor_local", th.tensor(local_of), persistent=False)
-        self.register_buffer("anchor_count", th.tensor(count_of), persistent=False)
+    def _box_branch(self, c, c_box):
+        return nn.Sequential(conv_block(c, c_box, k=3, act="silu"),
+                             conv_block(c_box, c_box, k=3, act="silu"),
+                             nn.Conv2d(c_box, 4 * self.reg_max, kernel_size=1))
 
-    def _init_objectness_bias(self):
-        # >>> [YOLOv3-NEW] start every objectness at p = 0.01 instead of 0.5.
-        # There are ~2000 boxes per image and at most one hand. At p = 0.5 the
-        # ~2000 "no object" BCE terms add up to a loss in the hundreds on step
-        # one, and since the backbone is shared that spike also hits the
-        # classification and segmentation heads. Starting near the true
-        # background rate removes it. (Trick from RetinaNet's focal-loss
-        # paper; YOLOv5 does the same.)
-        #
-        # >>> [YOLOv5-CHANGED] the prior now depends on the grid, as in YOLOv5
-        # (which uses log(8 / cells) for ~8 objects per COCO image): here there
-        # is one hand per image, so the prior is 1 / S^2 -- 1/49 on the 7x7 grid
-        # and 1/784 on the 28x28 one.
-        for pred, S in zip(self.preds, self.grids):
-            out = pred[-1]
-            with th.no_grad():
-                out.bias.view(-1, 5)[:, 4].fill_(math.log(1.0 / S ** 2))
+    @staticmethod
+    def _cls_branch(c, c_cls):
+        # YOLOv10's lightweight classification branch
+        return nn.Sequential(conv_block(c, c, k=3, g=c, act="silu"), conv_block(c, c_cls, k=1, act="silu"),
+                             conv_block(c_cls, c_cls, k=3, g=c_cls, act="silu"), conv_block(c_cls, c_cls, k=1, act="silu"),
+                             nn.Conv2d(c_cls, 1, kernel_size=1))
+
+    def _init_bias(self):
+        # YOLOv8's head init: box logits start flat (bias 1); the score starts
+        # at the prior rate log(5 / cells) -- one hand per image, ~5 of the
+        # cells around it are positives early in training.
+        for boxes, scores in ((self.o2m_box, self.o2m_cls), (self.o2o_box, self.o2o_cls)):
+            for b, c, S in zip(boxes, scores, self.grids):
+                with th.no_grad():
+                    b[-1].bias.fill_(1.0)
+                    c[-1].bias.fill_(math.log(5.0 / S ** 2))
 
     def layout(self):
-        """Everything yolo_detection_loss needs to map a box to its flat index."""
-        # >>> [YOLOv5-NEW] "scales": (S, first flat index, last + 1) per grid, for
-        # the per-scale objectness balance in the loss.
-        scales, start = [], 0
-        for S_i, group in zip(self.grids, self.groups):
-            end = start + S_i * S_i * len(group)
-            scales.append((S_i, start, end))
-            start = end
-        return {"anchors": self.anchors, "grid": self.anchor_grid,
-                "offset": self.anchor_offset, "local": self.anchor_local,
-                "count": self.anchor_count, "scales": scales}
+        """What the loss needs: point centres, which grid each point is on."""
+        return {"points": self.points, "grid": self.point_grid, "reg_max": self.reg_max}
 
-    def _decode(self, t, S, anchors):
-        # t: [N, S, S, A, 5] raw. Same YOLOv2 formula as before, per grid.
-        # .float(): decode in fp32 even under autocast, so sigmoid/exp do not
-        # saturate to exactly 0 or 1 in half precision.
-        t = t.float()
-        A = anchors.size(0)
-        cols = th.arange(S, device=t.device, dtype=t.dtype).view(1, 1, S, 1)
-        rows = th.arange(S, device=t.device, dtype=t.dtype).view(1, S, 1, 1)
-        # >>> [YOLOv5-CHANGED] see the class comment
-        y = th.sigmoid(t)
-        cx = (y[..., 0] * 2 - 0.5 + cols) / S
-        cy = (y[..., 1] * 2 - 0.5 + rows) / S
-        aw = anchors[:, 0].view(1, 1, 1, A).to(t.dtype)
-        ah = anchors[:, 1].view(1, 1, 1, A).to(t.dtype)
-        w = aw * (y[..., 2] * 2) ** 2
-        h = ah * (y[..., 3] * 2) ** 2
-        conf = y[..., 4]
-        return th.stack([cx, cy, w, h, conf], dim=-1)
+    def decode(self, raw):
+        """raw [N, M, 4*REG_MAX + 1] -> (cx, cy, w, h, score), all normalised."""
+        raw = raw.float()
+        N, M, _ = raw.shape
+        dist = raw[..., :4 * self.reg_max].view(N, M, 4, self.reg_max).softmax(dim=-1) @ self.proj
+        dist = dist / self.point_grid.view(1, M, 1).to(dist.dtype)              # cells -> image units
+        px, py = self.points[:, 0], self.points[:, 1]
+        x1, y1 = px - dist[..., 0], py - dist[..., 1]
+        x2, y2 = px + dist[..., 2], py + dist[..., 3]
+        score = th.sigmoid(raw[..., -1])
+        return th.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, score], dim=-1)
+
+    @staticmethod
+    def _run(features, boxes, scores):
+        out = []
+        for x, b, c in zip(features, boxes, scores):
+            y = th.cat([b(x), c(x)], dim=1)                                   # [N, 4R+1, S, S]
+            out.append(y.flatten(2).transpose(1, 2))                          # [N, S*S, 4R+1]
+        return th.cat(out, dim=1)
 
     def forward(self, features):
-        # features: (p7, p14, p28) from the neck, coarse first like GRIDS
-        outs, start = [], 0
-        for x, pred, S, group in zip(features, self.preds, self.grids, self.groups):
-            A = len(group)
+        # features: (n7, n14, n28) from the neck, coarse first like GRIDS
+        for x, S in zip(features, self.grids):
             assert x.shape[-1] == S, f"expected a {S}x{S} map, got {tuple(x.shape)}"
-            # Convert back to the form which torch expects (batch, height, width, channel)
-            t = pred(x).permute(0, 2, 3, 1).reshape(x.size(0), S, S, A, 5)
-            boxes = self._decode(t, S, self.anchors[start:start + A])
-            outs.append(boxes.reshape(x.size(0), -1, 5))
-            start += A
-        # [N, M, 5], M = 7*7*A7 + 14*14*A14 + 28*28*A28
-        return th.cat(outs, dim=1)
+        o2m = self._run(features, self.o2m_box, self.o2m_cls)
+        o2o = self._run([x.detach() for x in features], self.o2o_box, self.o2o_cls)
+        return th.cat([self.decode(o2o), o2m.float(), o2o.float()], dim=-1)
 
 
 class ClassificationHead(nn.Module):
@@ -371,41 +445,35 @@ class SegmentationHead(nn.Module):
     
 
 class HandGestureNet(nn.Module):
-    def __init__(self, in_channels=5, n_classes=10, B=2, anchors=None):   # >>> [YOLOv2-CHANGED] added `anchors`
+    def __init__(self, in_channels=5, n_classes=10, B=2, anchors=None):
+        # >>> [YOLOv10-CHANGED] `B` and `anchors` are accepted and ignored so old
+        # call sites keep working; the detector is anchor-free now.
         super().__init__()
         self.backbone = Backbone(in_channels)
-        # >>> [YOLOv3-NEW] the neck only feeds detection. Segmentation keeps its
-        # own U-Net decoder and classification keeps reading f7, so neither of
-        # those heads changes behaviour because of the new detector.
-        self.neck = PANNeck()     # >>> [YOLOv4-CHANGED] was FPNNeck
-        self.detecting_head = DetectionHead(B, anchors, in_channels=self.neck.out_channels)   # >>> [YOLOv3-CHANGED]
-        # >>> [YOLOv2-NEW] convenience handle for train.py / evaluate.py
-        self.anchors_list = self.detecting_head.anchors_list
+        # The neck only feeds detection. Segmentation keeps its own U-Net
+        # decoder and classification keeps reading f7.
+        self.neck = PANNeck()
+        self.detecting_head = DetectionHead(in_channels=self.neck.out_channels)
         self.classification_head = ClassificationHead(n_classes)
         self.segmentation_head = SegmentationHead()
 
     
     def forward(self, x):
         f56, f28, f14, f7 = self.backbone(x)
-        return (self.detecting_head(self.neck(f28, f14, f7)),    # >>> [YOLOv3-CHANGED]
+        return (self.detecting_head(self.neck(f28, f14, f7)),
                 self.segmentation_head(f56, f28, f14, f7),
                 self.classification_head(f7)
                 )
 
 
-# >>> [YOLOv2-NEW]
 def load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=None):
     """
-    Rebuild the network with the SAME anchors it was trained with, then pour
-    the weights in.
+    Rebuild the network and pour the trained weights in.
 
-    Why this has to exist: the weights of the detection head are corrections
-    relative to specific anchor shapes. Loading them into a model that was
-    built with different anchors gives you a model that runs, produces boxes,
-    and is quietly wrong. So the anchors are read back out of the checkpoint,
-    never re-guessed.
+    >>> [YOLOv10-CHANGED] no anchors to read back any more (anchor-free), but
+    the architecture check stays: a checkpoint from yolov2..yolov5 has a
+    completely different detection head.
     """
-    # >>> [YOLOv3-NEW] refuse checkpoints from another architecture up front
     arch = checkpoint.get("arch")
     if arch != ARCH:
         raise RuntimeError(
@@ -413,18 +481,7 @@ def load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=None):
             f"older) but this branch builds {ARCH!r}. The detection heads are "
             f"different networks; evaluate it on the branch it was trained on, "
             f"or retrain here.")
-    anchors = checkpoint.get("anchors")
-    if anchors is None:
-        state = checkpoint.get("model_state", {})
-        if "detecting_head.anchors" in state:
-            anchors = state["detecting_head.anchors"].tolist()
-        else:
-            raise RuntimeError(
-                "This checkpoint stores no anchors, so it comes from the "
-                "pre-YOLOv2 code. Evaluate it on the branch it was trained on, "
-                "or retrain on this branch.")
-    model = HandGestureNet(in_channels=in_channels, n_classes=n_classes,
-                           anchors=anchors)
+    model = HandGestureNet(in_channels=in_channels, n_classes=n_classes)
     model.load_state_dict(checkpoint["model_state"])
     if device is not None:
         model = model.to(device)

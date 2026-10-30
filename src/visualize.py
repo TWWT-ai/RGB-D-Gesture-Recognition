@@ -186,7 +186,7 @@ def main():
             test_frac=args.test_frac,
         )
 
-    # >>> [YOLOv2-CHANGED] rebuild with the checkpoint's own anchors
+    # rebuild the network and check the checkpoint's arch (load_handgesture_net)
     checkpoint = th.load(args.weights, map_location=device)
     model = load_handgesture_net(checkpoint, in_channels=4, n_classes=10, device=device)
     print(f"Loaded {args.weights}")
