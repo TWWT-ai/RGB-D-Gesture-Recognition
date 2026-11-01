@@ -11,6 +11,8 @@ Cheat Sheet.md
 *.pdf
 .vscode
 *.ipynb
+# clean (output-free) Kaggle runners are tracked; local notebooks with outputs stay ignored
+!notebooks/*.ipynb
 .agents/
 CLAUDE.md
 versions/
