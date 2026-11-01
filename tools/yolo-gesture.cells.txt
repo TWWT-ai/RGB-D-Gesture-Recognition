@@ -1,9 +1,9 @@
 # notebook : yolo-gesture.ipynb
-# cells    : 21
+# cells    : 23
 # nbformat : 4.4
 
 ===== CELL 000 [markdown] (0 output block(s)) =====
-<h1>YOLO Gesture jupyter notebook runner</h1>
+<h1>YOLO Gesture jupyter notebook runner (YOLOv3 branch)</h1>
 
 ===== CELL 001 [markdown] (0 output block(s)) =====
 <h2>1. Checking device and cloning repository</h2>
@@ -11,21 +11,36 @@
 ===== CELL 002 [code] (0 output block(s)) =====
 !nvidia-smi
 
-===== CELL 003 [code] (1 output block(s)) =====
+===== CELL 003 [code] (0 output block(s)) =====
 %cd /kaggle/working
 !rm -rf cw1
-!git clone --branch dev_3 https://github.com/TWWT-ai/Object-Detection.git cw1
+!git clone --branch yolov3 https://github.com/TWWT-ai/RGB-D-Gesture-Recognition.git cw1
 
-===== CELL 004 [code] (1 output block(s)) =====
+===== CELL 004 [code] (0 output block(s)) =====
 import os
 DATA = '/kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all'
 print('exists:', os.path.exists(DATA))
 !ls {DATA} | head
 
 ===== CELL 005 [markdown] (0 output block(s)) =====
+<h2>Fitting the anchors (k-means, 9 = 3 per grid)</h2>
+Fitted on the TRAIN persons of the exact split used below (same --seed / --val-frac / --test-frac); train.py refuses the file if the split differs.
+
+===== CELL 006 [code] (0 output block(s)) =====
+%cd /kaggle/working/cw1/src
+!python kmeans_anchors.py \
+    --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all/ \
+    --k 9 \
+    --val-frac 0.1 \
+    --test-frac 0 \
+    --seed 42 \
+    --out-json /kaggle/working/weights/anchors9.json \
+    --fig-out /kaggle/working/figures/anchor_kmeans.png
+
+===== CELL 007 [markdown] (0 output block(s)) =====
 <h2>Training dataset</h2>
 
-===== CELL 006 [code] (1 output block(s)) =====
+===== CELL 008 [code] (0 output block(s)) =====
 %cd /kaggle/working/cw1/src
 !python train.py \
     --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all/ \
@@ -35,109 +50,68 @@ print('exists:', os.path.exists(DATA))
     --lambda-cls 5 \
     --val-frac 0.1 \
     --test-frac 0 \
+    --anchors /kaggle/working/weights/anchors9.json \
     --out-dir /kaggle/working/weights/ \
     --seed 42
 
-===== CELL 007 [markdown] (0 output block(s)) =====
+===== CELL 009 [markdown] (0 output block(s)) =====
 <h2>2. Evaluating dataset</h2>
 
-===== CELL 008 [code] (1 output block(s)) =====
+===== CELL 010 [code] (0 output block(s)) =====
+%cd /kaggle/working/cw1/src
 !python evaluate.py \
     --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
     --weights /kaggle/working/weights/best.pth \
-    --n-val-persons 1 --seed 42
+    --val-frac 0.1 --test-frac 0 --seed 42
 
-===== CELL 009 [markdown] (0 output block(s)) =====
+===== CELL 011 [markdown] (0 output block(s)) =====
 <h2>3. Visualising the evaluated dataset</h2>
 
-===== CELL 010 [code] (24 output block(s)) =====
+===== CELL 012 [code] (0 output block(s)) =====
+%cd /kaggle/working/cw1/src
 !python visualize.py \
     --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
-    --weights /kaggle/working/weights_flip_aug/best.pth \
-    --history /kaggle/working/weights_flip_aug/history.json \
-    --out-dir /kaggle/working/figures_flip_aug/ --n-samples 10 --n-val-persons 1 --seed 42
+    --weights /kaggle/working/weights/best.pth \
+    --history /kaggle/working/weights/history.json \
+    --out-dir /kaggle/working/figures/ --n-samples 10 --val-frac 0.1 --test-frac 0 --seed 42
 
 import glob
 from IPython.display import Image, display
-for png in sorted(glob.glob('/kaggle/working/figures_flip_aug/*.png')):
+for png in sorted(glob.glob('/kaggle/working/figures/*.png')):
     print(png); display(Image(png, width=500))
 
-===== CELL 011 [markdown] (0 output block(s)) =====
+===== CELL 013 [markdown] (0 output block(s)) =====
 <h2>4. Saving trained data</h2>
 
-===== CELL 012 [code] (0 output block(s)) =====
+===== CELL 014 [code] (0 output block(s)) =====
 # Saving weights
 %cd /kaggle/working
-!zip -j trained_outputs.zip weights/best.pth weights/last.pth weights/history.json
+!zip -j trained_outputs.zip weights/best.pth weights/last.pth weights/history.json weights/anchors9.json
 
 from IPython.display import FileLink
 FileLink('trained_outputs.zip')
 
-===== CELL 013 [code] (0 output block(s)) =====
+===== CELL 015 [code] (0 output block(s)) =====
 # Saving figures
+%cd /kaggle/working
 !zip -r figures.zip figures/
 
 from IPython.display import FileLink
-FileLink('figures_test.zip')
-
-===== CELL 014 [markdown] (0 output block(s)) =====
-<h2>5. Testing on external test set</h2>
-
-===== CELL 015 [code] (24 output block(s)) =====
-!python evaluate.py \
-    --data-root /kaggle/input/datasets/temuulenwang/test-set \
-    --weights /kaggle/working/weights_flip_aug/best.pth \
-    --all-data
-!python visualize.py \
-    --data-root /kaggle/input/datasets/temuulenwang/test-set \
-    --weights /kaggle/working/weights_flip_aug/best.pth \
-    --history /kaggle/working/weights_flip_aug/history.json \
-    --out-dir /kaggle/working/figures_test_flip_aug/ \
-    --n-samples 10 \
-    --all-data
-
-import glob
-from IPython.display import Image, display
-for png in sorted(glob.glob('/kaggle/working/figures_test_flip_aug/*.png')):
-    print(png); display(Image(png, width=500))
+FileLink('figures.zip')
 
 ===== CELL 016 [markdown] (0 output block(s)) =====
-<h3> 5.1 Saving outputs</h3>
+<h2>5. Testing on external test set</h2>
 
 ===== CELL 017 [code] (0 output block(s)) =====
-!zip -r figures_test.zip figures_test/
-
-from IPython.display import FileLink
-FileLink('figures_test.zip')
-
-===== CELL 018 [markdown] (0 output block(s)) =====
-<h2>6. Loading fromn trained dataset</h2>
-
-===== CELL 019 [code] (22 output block(s)) =====
-!python evaluate.py \
-    --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
-    --weights /kaggle/input/datasets/temuulenwang/weights/best.pth \
-    --n-val-persons 1 --seed 42
-!python visualize.py \
-    --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
-    --weights /kaggle/input/datasets/temuulenwang/weights/best.pth \
-    --history /kaggle/input/datasets/temuulenwang/weights/istory.json \
-    --out-dir /kaggle/working/figures_pre_trained/ --n-samples 10 --n-val-persons 1 --seed 42
-
-import glob
-from IPython.display import Image, display
-for png in sorted(glob.glob('/kaggle/working/figures_pre_trained/*.png')):
-    print(png); display(Image(png, width=500))
-
-===== CELL 020 [code] (22 output block(s)) =====
+%cd /kaggle/working/cw1/src
 !python evaluate.py \
     --data-root /kaggle/input/datasets/temuulenwang/test-set \
-    --weights /kaggle/input/datasets/temuulenwang/weights/best.pth \
+    --weights /kaggle/working/weights/best.pth \
     --all-data
 !python visualize.py \
     --data-root /kaggle/input/datasets/temuulenwang/test-set \
-    --weights /kaggle/input/datasets/temuulenwang/weights/best.pth \
-    --history /kaggle/input/datasets/temuulenwang/history.json \
+    --weights /kaggle/working/weights/best.pth \
+    --history /kaggle/working/weights/history.json \
     --out-dir /kaggle/working/figures_test/ \
     --n-samples 10 \
     --all-data
@@ -145,4 +119,54 @@ for png in sorted(glob.glob('/kaggle/working/figures_pre_trained/*.png')):
 import glob
 from IPython.display import Image, display
 for png in sorted(glob.glob('/kaggle/working/figures_test/*.png')):
+    print(png); display(Image(png, width=500))
+
+===== CELL 018 [markdown] (0 output block(s)) =====
+<h3> 5.1 Saving outputs</h3>
+
+===== CELL 019 [code] (0 output block(s)) =====
+%cd /kaggle/working
+!zip -r figures_test.zip figures_test/
+
+from IPython.display import FileLink
+FileLink('figures_test.zip')
+
+===== CELL 020 [markdown] (0 output block(s)) =====
+<h2>6. Loading from trained dataset</h2>
+Upload <code>trained_outputs.zip</code> from section 4 as the Kaggle dataset <code>weights-yolov3</code>. The checkpoint must come from the <b>yolov3</b> branch: checkpoints from other branches are refused (different detection head).
+
+===== CELL 021 [code] (0 output block(s)) =====
+%cd /kaggle/working/cw1/src
+!python evaluate.py \
+    --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
+    --weights /kaggle/input/datasets/temuulenwang/weights-yolov3/best.pth \
+    --val-frac 0.1 --test-frac 0 --seed 42
+!python visualize.py \
+    --data-root /kaggle/input/datasets/temuulenwang/dataset-all/dataset_merged_all \
+    --weights /kaggle/input/datasets/temuulenwang/weights-yolov3/best.pth \
+    --history /kaggle/input/datasets/temuulenwang/weights-yolov3/history.json \
+    --out-dir /kaggle/working/figures_pre_trained/ --n-samples 10 --val-frac 0.1 --test-frac 0 --seed 42
+
+import glob
+from IPython.display import Image, display
+for png in sorted(glob.glob('/kaggle/working/figures_pre_trained/*.png')):
+    print(png); display(Image(png, width=500))
+
+===== CELL 022 [code] (0 output block(s)) =====
+%cd /kaggle/working/cw1/src
+!python evaluate.py \
+    --data-root /kaggle/input/datasets/temuulenwang/test-set \
+    --weights /kaggle/input/datasets/temuulenwang/weights-yolov3/best.pth \
+    --all-data
+!python visualize.py \
+    --data-root /kaggle/input/datasets/temuulenwang/test-set \
+    --weights /kaggle/input/datasets/temuulenwang/weights-yolov3/best.pth \
+    --history /kaggle/input/datasets/temuulenwang/weights-yolov3/history.json \
+    --out-dir /kaggle/working/figures_pre_trained_test/ \
+    --n-samples 10 \
+    --all-data
+
+import glob
+from IPython.display import Image, display
+for png in sorted(glob.glob('/kaggle/working/figures_pre_trained_test/*.png')):
     print(png); display(Image(png, width=500))
